@@ -333,10 +333,16 @@ static const NSInteger kValueNotFound = -1;
 
             if (upnpFault)
             {
+                NSLog(@"🔴 UPnP Fault received: %@", upnpFault);
+
+                NSString *errorCode = [[[[upnpFault objectForKey:@"detail"] objectForKeyEndingWithString:@":UPnPError"] objectForKeyEndingWithString:@":errorCode"] objectForKey:@"text"];
                 NSString *errorDescription = [[[[upnpFault objectForKey:@"detail"] objectForKeyEndingWithString:@":UPnPError"] objectForKeyEndingWithString:@":errorDescription"] objectForKey:@"text"];
 
+                NSLog(@"🔴 UPnP Error Code: %@", errorCode);
+                NSLog(@"🔴 UPnP Error Description: %@", errorDescription);
+
                 if (!errorDescription)
-                    errorDescription = @"Unknown UPnP error";
+                    errorDescription = [NSString stringWithFormat:@"Unknown UPnP error (code: %@, fault: %@)", errorCode ?: @"unknown", upnpFault];
 
                 if (command.callbackError)
                     dispatch_on_main(^{ command.callbackError([ConnectError generateErrorWithCode:ConnectStatusCodeTvError andDetails:errorDescription]); });
@@ -650,10 +656,14 @@ static const NSInteger kValueNotFound = -1;
 {
     [self getPositionInfoWithSuccess:^(NSDictionary *responseObject)
     {
+        NSLog(@"📊 GetPositionInfo Response: %@", responseObject);
         NSDictionary *response = [self responseDataFromResponse:responseObject
                                                       forMethod:@"GetPositionInfoResponse"];
+        NSLog(@"📊 Parsed GetPositionInfoResponse: %@", response);
         NSString *currentTimeString = [[response objectForKey:@"RelTime"] objectForKey:@"text"];
+        NSLog(@"📊 RelTime string from response: '%@'", currentTimeString);
         NSTimeInterval currentTime = [self timeForString:currentTimeString];
+        NSLog(@"📊 Parsed position time: %f seconds", currentTime);
 
         if (success)
             success(currentTime);
