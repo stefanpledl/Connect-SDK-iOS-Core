@@ -333,13 +333,13 @@ static const NSInteger kValueNotFound = -1;
 
             if (upnpFault)
             {
-                NSLog(@"🔴 UPnP Fault received: %@", upnpFault);
+                NSLog(@"[DLNA_DEBUG] 🔴 UPnP FAULT received: %@", upnpFault);
 
                 NSString *errorCode = [[[[upnpFault objectForKey:@"detail"] objectForKeyEndingWithString:@":UPnPError"] objectForKeyEndingWithString:@":errorCode"] objectForKey:@"text"];
                 NSString *errorDescription = [[[[upnpFault objectForKey:@"detail"] objectForKeyEndingWithString:@":UPnPError"] objectForKeyEndingWithString:@":errorDescription"] objectForKey:@"text"];
 
-                NSLog(@"🔴 UPnP Error Code: %@", errorCode);
-                NSLog(@"🔴 UPnP Error Description: %@", errorDescription);
+                NSLog(@"[DLNA_DEBUG] 🔴 Error Code: %@", errorCode);
+                NSLog(@"[DLNA_DEBUG] 🔴 Error Description: %@", errorDescription);
 
                 if (!errorDescription)
                     errorDescription = [NSString stringWithFormat:@"Unknown UPnP error (code: %@, fault: %@)", errorCode ?: @"unknown", upnpFault];
@@ -656,14 +656,14 @@ static const NSInteger kValueNotFound = -1;
 {
     [self getPositionInfoWithSuccess:^(NSDictionary *responseObject)
     {
-        NSLog(@"📊 GetPositionInfo Response: %@", responseObject);
+        NSLog(@"[DLNA_DEBUG] 📊 Parsing GetPositionInfo...");
         NSDictionary *response = [self responseDataFromResponse:responseObject
                                                       forMethod:@"GetPositionInfoResponse"];
-        NSLog(@"📊 Parsed GetPositionInfoResponse: %@", response);
+        NSLog(@"[DLNA_DEBUG] 📊 Parsed response dict: %@", response);
         NSString *currentTimeString = [[response objectForKey:@"RelTime"] objectForKey:@"text"];
-        NSLog(@"📊 RelTime string from response: '%@'", currentTimeString);
+        NSLog(@"[DLNA_DEBUG] 📊 RelTime string: '%@'", currentTimeString);
         NSTimeInterval currentTime = [self timeForString:currentTimeString];
-        NSLog(@"📊 Parsed position time: %f seconds", currentTime);
+        NSLog(@"[DLNA_DEBUG] 📊 Final parsed position: %f seconds", currentTime);
 
         if (success)
             success(currentTime);
@@ -715,8 +715,18 @@ static const NSInteger kValueNotFound = -1;
     NSDictionary *getPositionInfoPayload = @{kActionFieldName : @"\"urn:schemas-upnp-org:service:AVTransport:1#GetPositionInfo\"",
                                              kDataFieldName : getPositionInfoXML};
 
+    NSLog(@"[DLNA_DEBUG] 📤 GetPositionInfo REQUEST:");
+    NSLog(@"[DLNA_DEBUG] 📤 URL: %@", _avTransportControlURL);
+    NSLog(@"[DLNA_DEBUG] 📤 Action: %@", getPositionInfoPayload[kActionFieldName]);
+    NSLog(@"[DLNA_DEBUG] 📤 XML: %@", getPositionInfoXML);
+
     ServiceCommand *command = [[ServiceCommand alloc] initWithDelegate:self.serviceCommandDelegate target:_avTransportControlURL payload:getPositionInfoPayload];
-    command.callbackComplete = success;
+    command.callbackComplete = ^(NSDictionary *responseObject) {
+        NSLog(@"[DLNA_DEBUG] 📥 GetPositionInfo FULL RESPONSE: %@", responseObject);
+        if (success) {
+            success(responseObject);
+        }
+    };
     command.callbackError = failure;
     [command send];
 }
@@ -762,18 +772,24 @@ static const NSInteger kValueNotFound = -1;
     if (!timeString || [timeString isEqualToString:@""])
         return 0;
 
-    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-    [formatter setDateFormat:@"HH:m:ss"];
+    NSLog(@"[DLNA_DEBUG] ⏱️ Parsing time string: '%@'", timeString);
 
-    NSDate *time = [formatter dateFromString:timeString];
-    NSDate *midnight = [formatter dateFromString:@"00:00:00"];
+    // Split by colon to handle H:mm:ss or HH:mm:ss formats
+    NSArray *components = [timeString componentsSeparatedByString:@":"];
+    if (components.count != 3) {
+        NSLog(@"[DLNA_DEBUG] ⚠️ Invalid time format (expected H:mm:ss): '%@'", timeString);
+        return 0;
+    }
 
-    NSTimeInterval timeInterval = [time timeIntervalSinceDate:midnight];
+    // Parse hours, minutes, seconds (seconds may include milliseconds like "01.673")
+    int hours = [components[0] intValue];
+    int minutes = [components[1] intValue];
+    double seconds = [components[2] doubleValue]; // Use double to handle decimals
 
-    if (timeInterval < 0)
-        timeInterval = 0;
+    NSTimeInterval totalSeconds = hours * 3600 + minutes * 60 + seconds;
+    NSLog(@"[DLNA_DEBUG] ⏱️ Parsed: %dh %dm %.3fs = %.3f total seconds", hours, minutes, seconds, totalSeconds);
 
-    return timeInterval;
+    return totalSeconds;
 }
 
 - (NSString *) stringForTime:(NSTimeInterval)timeInterval
