@@ -656,14 +656,15 @@ static const NSInteger kValueNotFound = -1;
 {
     [self getPositionInfoWithSuccess:^(NSDictionary *responseObject)
     {
-        NSLog(@"[DLNA_DEBUG] 📊 Parsing GetPositionInfo...");
         NSDictionary *response = [self responseDataFromResponse:responseObject
                                                       forMethod:@"GetPositionInfoResponse"];
-        NSLog(@"[DLNA_DEBUG] 📊 Parsed response dict: %@", response);
         NSString *currentTimeString = [[response objectForKey:@"RelTime"] objectForKey:@"text"];
-        NSLog(@"[DLNA_DEBUG] 📊 RelTime string: '%@'", currentTimeString);
         NSTimeInterval currentTime = [self timeForString:currentTimeString];
-        NSLog(@"[DLNA_DEBUG] 📊 Final parsed position: %f seconds", currentTime);
+
+        // Only log if position is non-zero (reduces spam)
+        if (currentTime > 0) {
+            NSLog(@"[DLNA_DEBUG] Position: %@ → %.1fs", currentTimeString, currentTime);
+        }
 
         if (success)
             success(currentTime);
@@ -715,18 +716,9 @@ static const NSInteger kValueNotFound = -1;
     NSDictionary *getPositionInfoPayload = @{kActionFieldName : @"\"urn:schemas-upnp-org:service:AVTransport:1#GetPositionInfo\"",
                                              kDataFieldName : getPositionInfoXML};
 
-    NSLog(@"[DLNA_DEBUG] 📤 GetPositionInfo REQUEST:");
-    NSLog(@"[DLNA_DEBUG] 📤 URL: %@", _avTransportControlURL);
-    NSLog(@"[DLNA_DEBUG] 📤 Action: %@", getPositionInfoPayload[kActionFieldName]);
-    NSLog(@"[DLNA_DEBUG] 📤 XML: %@", getPositionInfoXML);
-
+    // Removed excessive logging - GetPositionInfo is called every second
     ServiceCommand *command = [[ServiceCommand alloc] initWithDelegate:self.serviceCommandDelegate target:_avTransportControlURL payload:getPositionInfoPayload];
-    command.callbackComplete = ^(NSDictionary *responseObject) {
-        NSLog(@"[DLNA_DEBUG] 📥 GetPositionInfo FULL RESPONSE: %@", responseObject);
-        if (success) {
-            success(responseObject);
-        }
-    };
+    command.callbackComplete = success;
     command.callbackError = failure;
     [command send];
 }
@@ -772,12 +764,9 @@ static const NSInteger kValueNotFound = -1;
     if (!timeString || [timeString isEqualToString:@""])
         return 0;
 
-    NSLog(@"[DLNA_DEBUG] ⏱️ Parsing time string: '%@'", timeString);
-
     // Split by colon to handle H:mm:ss or HH:mm:ss formats
     NSArray *components = [timeString componentsSeparatedByString:@":"];
     if (components.count != 3) {
-        NSLog(@"[DLNA_DEBUG] ⚠️ Invalid time format (expected H:mm:ss): '%@'", timeString);
         return 0;
     }
 
@@ -786,10 +775,7 @@ static const NSInteger kValueNotFound = -1;
     int minutes = [components[1] intValue];
     double seconds = [components[2] doubleValue]; // Use double to handle decimals
 
-    NSTimeInterval totalSeconds = hours * 3600 + minutes * 60 + seconds;
-    NSLog(@"[DLNA_DEBUG] ⏱️ Parsed: %dh %dm %.3fs = %.3f total seconds", hours, minutes, seconds, totalSeconds);
-
-    return totalSeconds;
+    return hours * 3600 + minutes * 60 + seconds;
 }
 
 - (NSString *) stringForTime:(NSTimeInterval)timeInterval
