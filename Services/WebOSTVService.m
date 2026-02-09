@@ -31,6 +31,9 @@
 #import "CTXMLReader.h"
 #import "RemoteCameraService.h"
 #import "ScreenMirroringService.h"
+#import <sys/socket.h>
+#import <netinet/in.h>
+#import <arpa/inet.h>
 
 #define kKeyboardEnter @"\x1b ENTER \x1b"
 #define kKeyboardDelete @"\x1b DELETE \x1b"
@@ -50,9 +53,14 @@
 
     BOOL _mouseInit;
     UIAlertView *_pinAlertView;
-    
+
     __weak id<RemoteCameraControlDelegate> _remoteCameraDelegate;
     __weak id<ScreenMirroringControlDelegate> _screenMirroringDelegate;
+
+    NSURL *_avTransportControlURL;
+    NSDate *_playbackStartTime;
+    NSTimeInterval _playbackPausedPosition;
+    BOOL _playbackPaused;
 }
 
 @end
@@ -137,6 +145,7 @@
     _serviceDescription.version = systemVersion;
 
     [self updateCapabilities];
+    [self updateAVTransportControlURL];
 }
 
 - (DeviceService *)dlnaService
@@ -152,6 +161,390 @@
         service = [device serviceWithName:@"DLNA"];
 
     return service;
+}
+
+#pragma mark - AVTransport (Direct SOAP)
+
+- (void)updateAVTransportControlURL
+{
+    _avTransportControlURL = nil;
+
+    // Try 1: Parse from the device description's service list
+    NSArray *serviceList = self.serviceDescription.serviceList;
+    NSLog(@"[WebOS_AVT] serviceList count: %lu, commandURL: %@",
+          (unsigned long)serviceList.count, self.serviceDescription.commandURL);
+
+    if (serviceList) {
+        for (NSDictionary *service in serviceList) {
+            NSString *serviceId = service[@"serviceId"][@"text"];
+            NSString *serviceType = service[@"serviceType"][@"text"];
+            NSLog(@"[WebOS_AVT]   service: id=%@, type=%@", serviceId, serviceType);
+            if ((serviceId && [serviceId rangeOfString:@":AVTransport"].location != NSNotFound) ||
+                (serviceType && [serviceType rangeOfString:@":AVTransport"].location != NSNotFound))
+            {
+                NSString *controlPath = service[@"controlURL"][@"text"];
+                if (controlPath) {
+                    if (![controlPath hasPrefix:@"/"])
+                        controlPath = [NSString stringWithFormat:@"/%@", controlPath];
+                    NSURL *commandURL = self.serviceDescription.commandURL;
+                    if (commandURL) {
+                        NSString *urlString = [NSString stringWithFormat:@"http://%@:%@%@",
+                                               commandURL.host, commandURL.port, controlPath];
+                        _avTransportControlURL = [NSURL URLWithString:urlString];
+                        NSLog(@"[WebOS_AVT] Found AVTransport from serviceList: %@", _avTransportControlURL);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // Try 2: Parse embedded devices in locationXML for AVTransport
+    if (!_avTransportControlURL && self.serviceDescription.locationXML) {
+        NSLog(@"[WebOS_AVT] Parsing locationXML for embedded MediaRenderer...");
+        NSError *xmlError;
+        NSDictionary *xmlDict = [CTXMLReader dictionaryForXMLString:self.serviceDescription.locationXML error:&xmlError];
+        if (!xmlError) {
+            NSDictionary *root = xmlDict[@"root"];
+            id device = root[@"device"];
+            // Check root device
+            NSString *controlPath = [self findAVTransportControlInDevice:device];
+            // Check embedded devices
+            if (!controlPath) {
+                id devices = device[@"deviceList"][@"device"];
+                NSArray *deviceArray = nil;
+                if ([devices isKindOfClass:[NSArray class]]) deviceArray = devices;
+                else if ([devices isKindOfClass:[NSDictionary class]]) deviceArray = @[devices];
+                for (NSDictionary *embeddedDevice in deviceArray) {
+                    NSString *deviceType = embeddedDevice[@"deviceType"][@"text"];
+                    NSLog(@"[WebOS_AVT]   Embedded device: %@", deviceType);
+                    controlPath = [self findAVTransportControlInDevice:embeddedDevice];
+                    if (controlPath) break;
+                }
+            }
+            if (controlPath) {
+                if (![controlPath hasPrefix:@"/"]) controlPath = [@"/" stringByAppendingString:controlPath];
+                NSString *host = self.serviceDescription.address;
+                NSURL *cmdURL = self.serviceDescription.commandURL;
+                NSString *urlStr = [NSString stringWithFormat:@"http://%@:%@%@",
+                                    host, cmdURL.port ?: @(3001), controlPath];
+                _avTransportControlURL = [NSURL URLWithString:urlStr];
+                NSLog(@"[WebOS_AVT] Found AVTransport from locationXML: %@", _avTransportControlURL);
+            } else {
+                NSLog(@"[WebOS_AVT] No AVTransport in locationXML embedded devices");
+            }
+        }
+    }
+
+    // Note: SSDP-based discovery of DLNA renderer happens in socketDidConnect
+    // after the WebSocket connects, via discoverDLNARendererViaSsdp
+}
+
+// Send a unicast SSDP M-SEARCH to the TV to discover its DLNA MediaRenderer
+- (void)discoverDLNARendererViaSsdp
+{
+    NSString *address = self.serviceDescription.address;
+    NSLog(@"[WebOS_AVT] Starting SSDP M-SEARCH for MediaRenderer on %@", address);
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock < 0) {
+            NSLog(@"[WebOS_AVT] Failed to create UDP socket");
+            return;
+        }
+
+        // Set receive timeout to 4 seconds
+        struct timeval tv;
+        tv.tv_sec = 4;
+        tv.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        // Send unicast M-SEARCH to the TV's IP
+        struct sockaddr_in destAddr;
+        memset(&destAddr, 0, sizeof(destAddr));
+        destAddr.sin_family = AF_INET;
+        destAddr.sin_port = htons(1900);
+        inet_pton(AF_INET, [address UTF8String], &destAddr.sin_addr);
+
+        NSString *search = [NSString stringWithFormat:
+            @"M-SEARCH * HTTP/1.1\r\n"
+            @"HOST: %@:1900\r\n"
+            @"MAN: \"ssdp:discover\"\r\n"
+            @"MX: 3\r\n"
+            @"ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n",
+            address];
+
+        const char *msg = [search UTF8String];
+        sendto(sock, msg, strlen(msg), 0, (struct sockaddr *)&destAddr, sizeof(destAddr));
+
+        // Also try multicast
+        struct sockaddr_in mcastAddr;
+        memset(&mcastAddr, 0, sizeof(mcastAddr));
+        mcastAddr.sin_family = AF_INET;
+        mcastAddr.sin_port = htons(1900);
+        inet_pton(AF_INET, "239.255.255.250", &mcastAddr.sin_addr);
+
+        NSString *mcastSearch =
+            @"M-SEARCH * HTTP/1.1\r\n"
+            @"HOST: 239.255.255.250:1900\r\n"
+            @"MAN: \"ssdp:discover\"\r\n"
+            @"MX: 3\r\n"
+            @"ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n";
+        const char *mcastMsg = [mcastSearch UTF8String];
+        sendto(sock, mcastMsg, strlen(mcastMsg), 0, (struct sockaddr *)&mcastAddr, sizeof(mcastAddr));
+
+        // Read responses — filter by TV's IP address
+        char buffer[4096];
+        NSString *foundLocation = nil;
+        struct sockaddr_in senderAddr;
+        socklen_t senderLen = sizeof(senderAddr);
+
+        for (int i = 0; i < 10; i++) {
+            senderLen = sizeof(senderAddr);
+            memset(&senderAddr, 0, sizeof(senderAddr));
+            ssize_t received = recvfrom(sock, buffer, sizeof(buffer) - 1, 0,
+                                        (struct sockaddr *)&senderAddr, &senderLen);
+            if (received <= 0) break;
+            buffer[received] = '\0';
+
+            // Get sender IP
+            char senderIP[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &senderAddr.sin_addr, senderIP, sizeof(senderIP));
+            NSString *senderIPStr = [NSString stringWithUTF8String:senderIP];
+            NSString *response = [NSString stringWithUTF8String:buffer];
+
+            NSLog(@"[WebOS_AVT] SSDP response from %@ (looking for %@)", senderIPStr, address);
+
+            // CRITICAL: Only accept responses from the TV's IP address
+            if (![senderIPStr isEqualToString:address]) {
+                // Also check LOCATION URL host as secondary filter
+                NSRegularExpression *locRegex = [NSRegularExpression
+                    regularExpressionWithPattern:@"LOCATION:\\s*(http[^\\r\\n]*)"
+                    options:NSRegularExpressionCaseInsensitive error:nil];
+                NSTextCheckingResult *locMatch = [locRegex firstMatchInString:response
+                    options:0 range:NSMakeRange(0, response.length)];
+                if (locMatch && locMatch.numberOfRanges > 1) {
+                    NSString *loc = [response substringWithRange:[locMatch rangeAtIndex:1]];
+                    NSURL *locURL = [NSURL URLWithString:loc];
+                    if ([locURL.host isEqualToString:address]) {
+                        NSLog(@"[WebOS_AVT] LOCATION host matches TV — accepting");
+                    } else {
+                        NSLog(@"[WebOS_AVT] Ignoring response from %@ (LOCATION: %@)", senderIPStr, loc);
+                        continue;
+                    }
+                } else {
+                    NSLog(@"[WebOS_AVT] Ignoring response from %@ (not TV)", senderIPStr);
+                    continue;
+                }
+            }
+
+            NSLog(@"[WebOS_AVT] SSDP response from TV:\n%@", response);
+
+            // Extract LOCATION header
+            NSRegularExpression *regex = [NSRegularExpression
+                regularExpressionWithPattern:@"LOCATION:\\s*(http[^\\r\\n]*)"
+                options:NSRegularExpressionCaseInsensitive error:nil];
+            NSTextCheckingResult *match = [regex firstMatchInString:response
+                options:0 range:NSMakeRange(0, response.length)];
+            if (match && match.numberOfRanges > 1) {
+                foundLocation = [response substringWithRange:[match rangeAtIndex:1]];
+                NSLog(@"[WebOS_AVT] Found MediaRenderer location from TV: %@", foundLocation);
+                break;
+            }
+        }
+        close(sock);
+
+        if (foundLocation) {
+            NSURL *locationURL = [NSURL URLWithString:foundLocation];
+            [self fetchMediaRendererDescription:locationURL];
+        } else {
+            NSLog(@"[WebOS_AVT] No MediaRenderer found via SSDP from TV at %@", address);
+        }
+    });
+}
+
+- (void)fetchMediaRendererDescription:(NSURL *)locationURL
+{
+    NSLog(@"[WebOS_AVT] Fetching MediaRenderer description from %@", locationURL);
+
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:locationURL
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            if (error || !data) {
+                NSLog(@"[WebOS_AVT] Failed to fetch MediaRenderer description: %@", error);
+                return;
+            }
+
+            NSString *xml = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            NSLog(@"[WebOS_AVT] MediaRenderer XML (first 500 chars): %@",
+                  [xml substringToIndex:MIN(500, xml.length)]);
+
+            // Parse the XML to find AVTransport controlURL
+            NSError *parseError;
+            NSDictionary *dict = [CTXMLReader dictionaryForXMLString:xml error:&parseError];
+            if (parseError) {
+                NSLog(@"[WebOS_AVT] XML parse error: %@", parseError);
+                return;
+            }
+
+            // Navigate: root > device > serviceList > service
+            NSDictionary *root = dict[@"root"];
+            id device = root[@"device"];
+
+            // Check root device services
+            NSString *controlPath = [self findAVTransportControlInDevice:device];
+
+            // Check embedded devices if not found
+            if (!controlPath) {
+                id devices = device[@"deviceList"][@"device"];
+                NSArray *deviceArray = nil;
+                if ([devices isKindOfClass:[NSArray class]]) deviceArray = devices;
+                else if ([devices isKindOfClass:[NSDictionary class]]) deviceArray = @[devices];
+
+                for (NSDictionary *embeddedDevice in deviceArray) {
+                    controlPath = [self findAVTransportControlInDevice:embeddedDevice];
+                    if (controlPath) break;
+                }
+            }
+
+            if (controlPath) {
+                // Construct full URL relative to the location URL
+                if (![controlPath hasPrefix:@"/"]) controlPath = [@"/" stringByAppendingString:controlPath];
+                NSString *urlStr = [NSString stringWithFormat:@"http://%@:%@%@",
+                                    locationURL.host, locationURL.port, controlPath];
+                NSURL *avtURL = [NSURL URLWithString:urlStr];
+
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    self->_avTransportControlURL = avtURL;
+                    NSLog(@"[WebOS_AVT] SSDP discovery SUCCESS! AVTransport URL: %@", avtURL);
+                });
+            } else {
+                NSLog(@"[WebOS_AVT] No AVTransport service found in MediaRenderer description");
+            }
+        }];
+    [task resume];
+}
+
+- (NSString *)findAVTransportControlInDevice:(NSDictionary *)device
+{
+    id services = device[@"serviceList"][@"service"];
+    NSArray *serviceArray = nil;
+    if ([services isKindOfClass:[NSArray class]]) serviceArray = services;
+    else if ([services isKindOfClass:[NSDictionary class]]) serviceArray = @[services];
+
+    for (NSDictionary *svc in serviceArray) {
+        NSString *serviceType = svc[@"serviceType"][@"text"];
+        if (serviceType && [serviceType containsString:@"AVTransport"]) {
+            return svc[@"controlURL"][@"text"];
+        }
+    }
+    return nil;
+}
+
+- (void)sendAVTransportSOAP:(NSString *)action
+                 soapAction:(NSString *)soapAction
+                   extraXML:(NSString *)extraXML
+                    success:(void (^)(NSString *responseXML))success
+                    failure:(FailureBlock)failure
+{
+    if (!_avTransportControlURL) {
+        if (failure) failure([ConnectError generateErrorWithCode:ConnectStatusCodeNotSupported andDetails:@"AVTransport URL not available"]);
+        return;
+    }
+
+    NSString *soapXML = [NSString stringWithFormat:
+        @"<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        @"<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
+        @"s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
+        @"<s:Body>"
+        @"<u:%@ xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">"
+        @"<InstanceID>0</InstanceID>"
+        @"%@"
+        @"</u:%@>"
+        @"</s:Body>"
+        @"</s:Envelope>",
+        action, extraXML ?: @"", action];
+
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:_avTransportControlURL];
+    [request setHTTPMethod:@"POST"];
+    [request setValue:@"text/xml; charset=\"utf-8\"" forHTTPHeaderField:@"Content-Type"];
+    [request setValue:soapAction forHTTPHeaderField:@"SOAPAction"];
+    [request setHTTPBody:[soapXML dataUsingEncoding:NSUTF8StringEncoding]];
+    [request setTimeoutInterval:5.0];
+
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:request
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (error) {
+                    if (failure) failure(error);
+                    return;
+                }
+                NSString *xml = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                if (success) success(xml);
+            });
+        }];
+    [task resume];
+}
+
+- (NSString *)extractXMLValue:(NSString *)tagName fromXML:(NSString *)xml
+{
+    // Match <tagName>value</tagName> or <namespace:tagName>value</namespace:tagName>
+    NSString *pattern = [NSString stringWithFormat:@"<(?:[^:>]*:)?%@[^>]*>([^<]*)</(?:[^:>]*:)?%@>", tagName, tagName];
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:pattern options:0 error:nil];
+    NSTextCheckingResult *match = [regex firstMatchInString:xml options:0 range:NSMakeRange(0, xml.length)];
+    if (match && match.numberOfRanges > 1) {
+        return [xml substringWithRange:[match rangeAtIndex:1]];
+    }
+    return nil;
+}
+
+- (NSTimeInterval)avtTimeIntervalFromString:(NSString *)timeString
+{
+    if (!timeString || [timeString isEqualToString:@"NOT_IMPLEMENTED"]) return 0;
+    NSArray *parts = [timeString componentsSeparatedByString:@":"];
+    if (parts.count != 3) return 0;
+    return [parts[0] doubleValue] * 3600.0 + [parts[1] doubleValue] * 60.0 + [parts[2] doubleValue];
+}
+
+- (NSString *)avtStringFromTimeInterval:(NSTimeInterval)interval
+{
+    int hours = (int)(interval / 3600);
+    int minutes = (int)((interval - hours * 3600) / 60);
+    int seconds = (int)(interval - hours * 3600 - minutes * 60);
+    return [NSString stringWithFormat:@"%02d:%02d:%02d", hours, minutes, seconds];
+}
+
+- (NSTimeInterval)estimatedPlaybackPosition
+{
+    if (!_playbackStartTime) return 0;
+    if (_playbackPaused) return _playbackPausedPosition;
+    return -[_playbackStartTime timeIntervalSinceNow];
+}
+
+typedef NSTimeInterval (^SSAPMediaExtractor)(NSDictionary *response);
+
+- (void)trySSAPMediaQuery:(NSArray<NSString *> *)uris
+                  atIndex:(NSUInteger)index
+                extractor:(SSAPMediaExtractor)extractor
+                  success:(void (^)(NSTimeInterval))success
+                  failure:(FailureBlock)failure
+{
+    if (index >= uris.count) {
+        // All endpoints failed
+        if (success) success(0);
+        return;
+    }
+
+    NSURL *URL = [NSURL URLWithString:uris[index]];
+    ServiceCommand *command = [ServiceAsyncCommand commandWithDelegate:self.socket target:URL payload:nil];
+    command.callbackComplete = ^(NSDictionary *response) {
+        NSTimeInterval value = extractor(response);
+        if (success) success(value);
+    };
+    command.callbackError = ^(NSError *error) {
+        NSLog(@"[WebOS_AVT] SSAP query failed: %@ — %@", uris[index], error.localizedDescription);
+        [self trySSAPMediaQuery:uris atIndex:index + 1 extractor:extractor success:success failure:failure];
+    };
+    [command send];
 }
 
 - (void) updateCapabilities
@@ -403,6 +796,41 @@
 
     if ([self.delegate respondsToSelector:@selector(deviceServiceConnectionSuccess:)])
         dispatch_on_main(^{ [self.delegate deviceServiceConnectionSuccess:self]; });
+
+    // Log available SSAP services for media control discovery
+    [self discoverSSAPMediaEndpoints];
+
+    // Discover the TV's DLNA MediaRenderer via SSDP M-SEARCH (for position/duration)
+    if (!_avTransportControlURL) {
+        [self discoverDLNARendererViaSsdp];
+    }
+}
+
+- (void)discoverSSAPMediaEndpoints
+{
+    NSURL *URL = [NSURL URLWithString:@"ssap://api/getServiceList"];
+    ServiceCommand *command = [ServiceAsyncCommand commandWithDelegate:self.socket target:URL payload:nil];
+    command.callbackComplete = ^(NSDictionary *response) {
+        NSArray *services = response[@"services"];
+        NSLog(@"[WebOS_AVT] === Available SSAP services (%lu) ===", (unsigned long)services.count);
+        for (NSDictionary *svc in services) {
+            NSString *name = svc[@"name"];
+            // Log media-related services
+            if ([name containsString:@"media"] || [name containsString:@"Media"] ||
+                [name containsString:@"play"] || [name containsString:@"Play"] ||
+                [name containsString:@"avt"] || [name containsString:@"AVT"] ||
+                [name containsString:@"transport"] || [name containsString:@"dmr"] ||
+                [name containsString:@"controller"])
+            {
+                NSLog(@"[WebOS_AVT]   ** %@", svc);
+            }
+        }
+        NSLog(@"[WebOS_AVT] === All services: %@ ===", [services valueForKey:@"name"]);
+    };
+    command.callbackError = ^(NSError *error) {
+        NSLog(@"[WebOS_AVT] getServiceList error: %@", error);
+    };
+    [command send];
 }
 
 - (void) socket:(WebOSTVServiceSocketClient *)socket didFailWithError:(NSError *)error
@@ -886,51 +1314,21 @@
 
 - (void) displayImageWithMediaInfo:(MediaInfo *)mediaInfo success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
 {
-    NSURL *iconURL;
-    if(mediaInfo.images){
-        ImageInfo *imageInfo = [mediaInfo.images firstObject];
-        iconURL = imageInfo.url;
-    }
-    if ([self.serviceDescription.version isEqualToString:@"4.0.0"])
+    if (self.dlnaService)
     {
-        if (self.dlnaService)
+        id<MediaPlayer> mediaPlayer;
+
+        if ([self.dlnaService respondsToSelector:@selector(mediaPlayer)])
+            mediaPlayer = [self.dlnaService performSelector:@selector(mediaPlayer)];
+
+        if (mediaPlayer && [mediaPlayer respondsToSelector:@selector(displayImageWithMediaInfo:success:failure:)])
         {
-            id<MediaPlayer> mediaPlayer;
-            
-            if ([self.dlnaService respondsToSelector:@selector(mediaPlayer)])
-                mediaPlayer = [self.dlnaService performSelector:@selector(mediaPlayer)];
-            
-            if (mediaPlayer && [mediaPlayer respondsToSelector:@selector(playMedia:iconURL:title:description:mimeType:shouldLoop:success:failure:)])
-            {
-                [mediaPlayer displayImageWithMediaInfo:mediaInfo success:success failure:failure];
-                return;
-            }
+            [mediaPlayer displayImageWithMediaInfo:mediaInfo success:success failure:failure];
+            return;
         }
-        
-        NSDictionary *params = @{
-                                 @"target" : ensureString(mediaInfo.url.absoluteString),
-                                 @"iconSrc" : ensureString(iconURL.absoluteString),
-                                 @"title" : ensureString(mediaInfo.title),
-                                 @"description" : ensureString(mediaInfo.description),
-                                 @"mimeType" : ensureString(mediaInfo.mimeType)
-                                 };
-        
-        [self displayMediaWithParams:params success:success failure:failure];
-    } else
-    {
-        NSString *webAppId = @"MediaPlayer";
-        
-        WebAppLaunchSuccessBlock connectSuccess = ^(WebAppSession *webAppSession)
-        {
-            WebOSWebAppSession *session = (WebOSWebAppSession *)webAppSession;
-            [session.mediaPlayer displayImageWithMediaInfo:mediaInfo success:success failure:failure];
-        };
-        
-        [self joinWebAppWithId:webAppId success:connectSuccess failure:^(NSError *error)
-         {
-             [self launchWebApp:webAppId success:connectSuccess failure:failure];
-         }];
     }
+
+    [self launchNativeMediaPlayerWithMediaInfo:mediaInfo mediaType:@"PHOTO" success:success failure:failure];
 }
 
 - (void) playMedia:(NSURL *)mediaURL iconURL:(NSURL *)iconURL title:(NSString *)title description:(NSString *)description mimeType:(NSString *)mimeType shouldLoop:(BOOL)shouldLoop success:(MediaPlayerDisplaySuccessBlock)success failure:(FailureBlock)failure
@@ -958,53 +1356,30 @@
 
 - (void) playMediaWithMediaInfo:(MediaInfo *)mediaInfo shouldLoop:(BOOL)shouldLoop success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
 {
-    NSURL *iconURL;
-    if(mediaInfo.images){
-        ImageInfo *imageInfo = [mediaInfo.images firstObject];
-        iconURL = imageInfo.url;
-    }
-    
-    if ([self.serviceDescription.version isEqualToString:@"4.0.0"])
+    // Prefer DLNA (UPnP AVTransport): gives position/duration/seek tracking
+    // and opens the TV's native media player. Fall back to SSAP native app
+    // launch if DLNA service is unavailable.
+    if (self.dlnaService)
     {
-        if (self.dlnaService)
+        id<MediaPlayer> mediaPlayer;
+
+        if ([self.dlnaService respondsToSelector:@selector(mediaPlayer)])
+            mediaPlayer = [self.dlnaService performSelector:@selector(mediaPlayer)];
+
+        if (mediaPlayer && [mediaPlayer respondsToSelector:@selector(playMediaWithMediaInfo:shouldLoop:success:failure:)])
         {
-            id<MediaPlayer> mediaPlayer;
-            
-            if ([self.dlnaService respondsToSelector:@selector(mediaPlayer)])
-                mediaPlayer = [self.dlnaService performSelector:@selector(mediaPlayer)];
-            
-            if (mediaPlayer && [mediaPlayer respondsToSelector:@selector(playMediaWithMediaInfo:shouldLoop:success:failure:)])
-            {
-                [mediaPlayer playMediaWithMediaInfo:mediaInfo shouldLoop:shouldLoop success:success failure:failure];
-                return;
-            }
+            [mediaPlayer playMediaWithMediaInfo:mediaInfo shouldLoop:shouldLoop success:success failure:failure];
+            return;
         }
-        
-        NSDictionary *params = @{
-                                 @"target" : ensureString(mediaInfo.url.absoluteString),
-                                 @"iconSrc" : ensureString(iconURL.absoluteString),
-                                 @"title" : ensureString(mediaInfo.title),
-                                 @"description" : ensureString(mediaInfo.description),
-                                 @"mimeType" : ensureString(mediaInfo.mimeType),
-                                 @"loop" : shouldLoop ? @"true" : @"false"
-                                 };
-        
-        [self displayMediaWithParams:params success:success failure:failure];
-    } else
-    {
-        NSString *webAppId = @"MediaPlayer";
-        
-        WebAppLaunchSuccessBlock connectSuccess = ^(WebAppSession *webAppSession)
-        {
-            WebOSWebAppSession *session = (WebOSWebAppSession *)webAppSession;
-            [session.mediaPlayer playMediaWithMediaInfo:mediaInfo shouldLoop:shouldLoop success:success failure:failure];
-        };
-        
-        [self joinWebAppWithId:webAppId success:connectSuccess failure:^(NSError *error)
-         {
-             [self launchWebApp:webAppId success:connectSuccess failure:failure];
-         }];
     }
+
+    // Fallback: launch native media player app via SSAP
+    NSString *mediaType = @"VIDEO";
+    if (mediaInfo.mimeType) {
+        if ([mediaInfo.mimeType hasPrefix:@"audio"]) mediaType = @"MUSIC";
+    }
+
+    [self launchNativeMediaPlayerWithMediaInfo:mediaInfo mediaType:mediaType success:success failure:failure];
 }
 
 - (void)displayMediaWithParams:(NSDictionary *)params success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
@@ -1026,6 +1401,96 @@
         }
     };
     command.callbackError = failure;
+    [command send];
+}
+
+- (void)launchNativeMediaPlayerWithMediaInfo:(MediaInfo *)mediaInfo mediaType:(NSString *)mediaType success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
+{
+    // Launch the native media player app via ssap://system.launcher/launch.
+    // This works on all webOS versions (3.x–7.x+). The app ID varies by version:
+    //   webOS 3-5: com.webos.app.photovideo
+    //   webOS 6+:  com.webos.app.mediadiscovery
+    // We try mediadiscovery first; if it fails, fall back to photovideo.
+
+    NSString *fileName = mediaInfo.title ?: @"Media";
+
+    // Build the DLNA-style protocolInfo based on MIME type
+    NSString *mimeType = mediaInfo.mimeType ?: @"video/mp4";
+    NSString *protocolInfo = [NSString stringWithFormat:@"http-get:*:%@:DLNA.ORG_OP=01", mimeType];
+
+    NSDictionary *mediaItem = @{
+        @"fullPath"  : ensureString(mediaInfo.url.absoluteString),
+        @"fileName"  : fileName,
+        @"mediaType" : mediaType,
+        @"deviceType": @"DMR",
+        @"dlnaInfo"  : @{
+            @"flagVal"     : @4096,
+            @"opVal"       : @1,
+            @"protocolInfo": protocolInfo
+        }
+    };
+
+    NSString *primaryAppId = @"com.webos.app.mediadiscovery";
+    NSString *fallbackAppId = @"com.webos.app.photovideo";
+
+    NSDictionary *payload = @{
+        @"id"     : primaryAppId,
+        @"params" : @{ @"payload" : @[ mediaItem ] }
+    };
+
+    NSURL *URL = [NSURL URLWithString:@"ssap://system.launcher/launch"];
+
+    ServiceCommand *command = [[ServiceCommand alloc] initWithDelegate:self.serviceCommandDelegate target:URL payload:payload];
+    command.callbackComplete = ^(NSDictionary *responseObject)
+    {
+        // Track playback start time for position estimation
+        self->_playbackStartTime = [NSDate date];
+        self->_playbackPausedPosition = 0;
+        self->_playbackPaused = NO;
+        NSLog(@"[WebOS_AVT] Media launched, tracking playback start time");
+
+        LaunchSession *launchSession = [LaunchSession launchSessionForAppId:[responseObject objectForKey:@"id"]];
+        launchSession.sessionId = [responseObject objectForKey:@"sessionId"];
+        launchSession.sessionType = LaunchSessionTypeMedia;
+        launchSession.service = self;
+        launchSession.rawData = [responseObject copy];
+
+        MediaLaunchObject *launchObject = [[MediaLaunchObject alloc] initWithLaunchSession:launchSession andMediaControl:self.mediaControl];
+        if (success) {
+            success(launchObject);
+        }
+    };
+    command.callbackError = ^(NSError *error)
+    {
+        // Primary app not found — try fallback app ID (older webOS)
+        NSDictionary *fallbackPayload = @{
+            @"id"     : fallbackAppId,
+            @"params" : @{ @"payload" : @[ mediaItem ] }
+        };
+
+        ServiceCommand *fallbackCommand = [[ServiceCommand alloc] initWithDelegate:self.serviceCommandDelegate target:URL payload:fallbackPayload];
+        fallbackCommand.callbackComplete = ^(NSDictionary *responseObject)
+        {
+            // Track playback start time for position estimation
+            self->_playbackStartTime = [NSDate date];
+            self->_playbackPausedPosition = 0;
+            self->_playbackPaused = NO;
+            NSLog(@"[WebOS_AVT] Media launched (fallback), tracking playback start time");
+
+            LaunchSession *launchSession = [LaunchSession launchSessionForAppId:[responseObject objectForKey:@"id"]];
+            launchSession.sessionId = [responseObject objectForKey:@"sessionId"];
+            launchSession.sessionType = LaunchSessionTypeMedia;
+            launchSession.service = self;
+            launchSession.rawData = [responseObject copy];
+
+            MediaLaunchObject *launchObject = [[MediaLaunchObject alloc] initWithLaunchSession:launchSession andMediaControl:self.mediaControl];
+            if (success) {
+                success(launchObject);
+            }
+        };
+        fallbackCommand.callbackError = failure;
+        [fallbackCommand send];
+    };
     [command send];
 }
 
@@ -1051,7 +1516,14 @@
     NSURL *URL = [NSURL URLWithString:@"ssap://media.controls/play"];
 
     ServiceCommand *command = [ServiceAsyncCommand commandWithDelegate:self.socket target:URL payload:nil];
-    command.callbackComplete = success;
+    command.callbackComplete = ^(id response) {
+        // Resume from paused position
+        if (self->_playbackPaused && self->_playbackPausedPosition > 0) {
+            self->_playbackStartTime = [NSDate dateWithTimeIntervalSinceNow:-self->_playbackPausedPosition];
+            self->_playbackPaused = NO;
+        }
+        if (success) success(response);
+    };
     command.callbackError = failure;
     [command send];
 }
@@ -1061,7 +1533,14 @@
     NSURL *URL = [NSURL URLWithString:@"ssap://media.controls/pause"];
 
     ServiceCommand *command = [ServiceAsyncCommand commandWithDelegate:self.socket target:URL payload:nil];
-    command.callbackComplete = success;
+    command.callbackComplete = ^(id response) {
+        // Save current position estimate
+        if (self->_playbackStartTime && !self->_playbackPaused) {
+            self->_playbackPausedPosition = -[self->_playbackStartTime timeIntervalSinceNow];
+            self->_playbackPaused = YES;
+        }
+        if (success) success(response);
+    };
     command.callbackError = failure;
     [command send];
 }
@@ -1071,7 +1550,11 @@
     NSURL *URL = [NSURL URLWithString:@"ssap://media.controls/stop"];
 
     ServiceCommand *command = [ServiceAsyncCommand commandWithDelegate:self.socket target:URL payload:nil];
-    command.callbackComplete = success;
+    command.callbackComplete = ^(id response) {
+        self->_playbackStartTime = nil;
+        self->_playbackPaused = NO;
+        if (success) success(response);
+    };
     command.callbackError = failure;
     [command send];
 }
@@ -1098,22 +1581,205 @@
 
 - (void)seek:(NSTimeInterval)position success:(SuccessBlock)success failure:(FailureBlock)failure
 {
-    [self sendNotSupportedFailure:failure];
+    if (_avTransportControlURL) {
+        NSString *timeStr = [self avtStringFromTimeInterval:position];
+        NSString *extraXML = [NSString stringWithFormat:@"<Unit>REL_TIME</Unit><Target>%@</Target>", timeStr];
+        [self sendAVTransportSOAP:@"Seek"
+                       soapAction:@"\"urn:schemas-upnp-org:service:AVTransport:1#Seek\""
+                         extraXML:extraXML
+                          success:^(NSString *xml) { if (success) success(nil); }
+                          failure:failure];
+        return;
+    }
+
+    // Update position tracker for the seek
+    if (_playbackPaused) {
+        _playbackPausedPosition = position;
+    } else {
+        _playbackStartTime = [NSDate dateWithTimeIntervalSinceNow:-position];
+    }
+
+    DeviceService *dlna = self.dlnaService;
+    if (dlna && [dlna conformsToProtocol:@protocol(MediaControl)]) {
+        [(id<MediaControl>)dlna seek:position success:success failure:failure];
+    } else {
+        // No seek capability via SSAP — but we've updated the position tracker
+        if (success) success(nil);
+    }
 }
 
 - (void)getPlayStateWithSuccess:(MediaPlayStateSuccessBlock)success failure:(FailureBlock)failure
 {
-    [self sendNotSupportedFailure:failure];
+    if (_avTransportControlURL) {
+        [self sendAVTransportSOAP:@"GetTransportInfo"
+                       soapAction:@"\"urn:schemas-upnp-org:service:AVTransport:1#GetTransportInfo\""
+                         extraXML:nil
+                          success:^(NSString *xml) {
+            NSString *state = [self extractXMLValue:@"CurrentTransportState" fromXML:xml];
+            MediaControlPlayState playState = MediaControlPlayStateUnknown;
+            if ([state isEqualToString:@"PLAYING"])           playState = MediaControlPlayStatePlaying;
+            else if ([state isEqualToString:@"PAUSED_PLAYBACK"]) playState = MediaControlPlayStatePaused;
+            else if ([state isEqualToString:@"STOPPED"])         playState = MediaControlPlayStateFinished;
+            else if ([state isEqualToString:@"TRANSITIONING"])   playState = MediaControlPlayStateIdle;
+            else if ([state isEqualToString:@"NO_MEDIA_PRESENT"])playState = MediaControlPlayStateIdle;
+            if (success) success(playState);
+        } failure:failure];
+        return;
+    }
+
+    // Use foreground app info + local pause tracking for play state
+    // IMPORTANT: Must use ServiceCommand (not ServiceAsyncCommand) to wait for SSAP response
+    NSURL *URL = [NSURL URLWithString:@"ssap://com.webos.applicationManager/getForegroundAppInfo"];
+    ServiceCommand *command = [ServiceCommand commandWithDelegate:self.socket target:URL payload:nil];
+    command.callbackComplete = ^(NSDictionary *response) {
+        NSString *appId = response[@"appId"];
+        BOOL isMediaApp = ([appId isEqualToString:@"com.webos.app.mediadiscovery"] ||
+                           [appId isEqualToString:@"com.webos.app.photovideo"] ||
+                           [appId isEqualToString:@"com.webos.app.mediaviewer"]);
+
+        if (isMediaApp) {
+            if (self->_playbackPaused) {
+                if (success) success(MediaControlPlayStatePaused);
+            } else {
+                if (success) success(MediaControlPlayStatePlaying);
+            }
+        } else {
+            // Media app not in foreground — playback finished or user exited
+            self->_playbackStartTime = nil;
+            if (success) success(MediaControlPlayStateFinished);
+        }
+    };
+    command.callbackError = ^(NSError *error) {
+        NSLog(@"[WebOS_AVT] getForegroundAppInfo error: %@", error);
+        if (success) success(MediaControlPlayStateUnknown);
+    };
+    [command send];
 }
 
 - (void)getDurationWithSuccess:(MediaDurationSuccessBlock)success
                        failure:(FailureBlock)failure {
-    [self sendNotSupportedFailure:failure];
+    if (_avTransportControlURL) {
+        [self sendAVTransportSOAP:@"GetPositionInfo"
+                       soapAction:@"\"urn:schemas-upnp-org:service:AVTransport:1#GetPositionInfo\""
+                         extraXML:nil
+                          success:^(NSString *xml) {
+            NSString *durationStr = [self extractXMLValue:@"TrackDuration" fromXML:xml];
+            NSTimeInterval duration = [self avtTimeIntervalFromString:durationStr];
+            if (success) success(duration);
+        } failure:failure];
+        return;
+    }
+
+    // Try SSAP mediacontroller for duration
+    [self queryMediaControllerForValue:@"duration" success:^(NSTimeInterval value) {
+        NSLog(@"[WebOS_AVT] Duration from mediacontroller: %.1f", value);
+        if (success) success(value);
+    } failure:^(NSError *error) {
+        NSLog(@"[WebOS_AVT] Duration query failed: %@", error.localizedDescription);
+        if (success) success(0);
+    }];
 }
 
 - (void)getPositionWithSuccess:(MediaPositionSuccessBlock)success failure:(FailureBlock)failure
 {
-    [self sendNotSupportedFailure:failure];
+    if (_avTransportControlURL) {
+        [self sendAVTransportSOAP:@"GetPositionInfo"
+                       soapAction:@"\"urn:schemas-upnp-org:service:AVTransport:1#GetPositionInfo\""
+                         extraXML:nil
+                          success:^(NSString *xml) {
+            NSString *relTime = [self extractXMLValue:@"RelTime" fromXML:xml];
+            NSTimeInterval position = [self avtTimeIntervalFromString:relTime];
+            if (success) success(position);
+        } failure:failure];
+        return;
+    }
+
+    // Try SSAP mediacontroller, then fall back to time-based estimation
+    [self queryMediaControllerForValue:@"position" success:^(NSTimeInterval value) {
+        if (value > 0) {
+            if (success) success(value);
+        } else {
+            // Fallback: estimate from playback start time
+            NSTimeInterval estimated = [self estimatedPlaybackPosition];
+            NSLog(@"[WebOS_AVT] Position estimated from elapsed time: %.1f", estimated);
+            if (success) success(estimated);
+        }
+    } failure:^(NSError *error) {
+        // Fallback: estimate from playback start time
+        NSTimeInterval estimated = [self estimatedPlaybackPosition];
+        NSLog(@"[WebOS_AVT] Position estimated (after error): %.1f", estimated);
+        if (success) success(estimated);
+    }];
+}
+
+// Query com.webos.service.mediacontroller for position or duration
+- (void)queryMediaControllerForValue:(NSString *)valueType
+                             success:(void (^)(NSTimeInterval))success
+                             failure:(FailureBlock)failure
+{
+    // Step 1: Get active media sessions (no params required)
+    NSURL *sessionsURL = [NSURL URLWithString:@"ssap://com.webos.service.mediacontroller/getActiveMediaSessions"];
+    ServiceCommand *sessionsCmd = [ServiceAsyncCommand commandWithDelegate:self.socket target:sessionsURL payload:nil];
+    sessionsCmd.callbackComplete = ^(NSDictionary *response) {
+        NSLog(@"[WebOS_AVT] getActiveMediaSessions: %@", response);
+
+        NSArray *sessions = response[@"mediaSessionList"];
+        if (!sessions) sessions = response[@"activeMediaSessions"];
+
+        NSString *mediaId = sessions.firstObject;
+        if (!mediaId) {
+            NSLog(@"[WebOS_AVT] No active media sessions");
+            if (success) success(0);
+            return;
+        }
+
+        // Step 2: Query for the specific value using the mediaId
+        if ([valueType isEqualToString:@"position"]) {
+            // Try receiveMediaPlaybackInfo with subscribe for position
+            NSURL *statusURL = [NSURL URLWithString:@"ssap://com.webos.service.mediacontroller/getMediaPlayStatus"];
+            NSDictionary *payload = @{@"mediaId": mediaId};
+            ServiceCommand *statusCmd = [ServiceAsyncCommand commandWithDelegate:self.socket target:statusURL payload:payload];
+            statusCmd.callbackComplete = ^(NSDictionary *statusResponse) {
+                NSLog(@"[WebOS_AVT] getMediaPlayStatus: %@", statusResponse);
+                // Position might be in playPosition field
+                NSTimeInterval pos = [statusResponse[@"playPosition"] doubleValue];
+                if (pos <= 0) pos = [statusResponse[@"position"] doubleValue];
+                if (pos <= 0) pos = [statusResponse[@"currentTime"] doubleValue];
+                if (success) success(pos);
+            };
+            statusCmd.callbackError = ^(NSError *error) {
+                NSLog(@"[WebOS_AVT] getMediaPlayStatus error: %@", error.localizedDescription);
+                if (success) success(0);
+            };
+            [statusCmd send];
+        } else {
+            // Duration - try getMediaSessionInfo which includes metadata
+            NSURL *infoURL = [NSURL URLWithString:@"ssap://com.webos.service.mediacontroller/getMediaSessionInfo"];
+            NSDictionary *payload = @{@"mediaId": mediaId};
+            ServiceCommand *infoCmd = [ServiceAsyncCommand commandWithDelegate:self.socket target:infoURL payload:payload];
+            infoCmd.callbackComplete = ^(NSDictionary *infoResponse) {
+                NSLog(@"[WebOS_AVT] getMediaSessionInfo: %@", infoResponse);
+                NSTimeInterval dur = [infoResponse[@"duration"] doubleValue];
+                if (dur <= 0) dur = [infoResponse[@"totalTime"] doubleValue];
+                if (dur <= 0) {
+                    // Try nested in metadata
+                    NSDictionary *meta = infoResponse[@"metaData"];
+                    dur = [meta[@"duration"] doubleValue];
+                }
+                if (success) success(dur);
+            };
+            infoCmd.callbackError = ^(NSError *error) {
+                NSLog(@"[WebOS_AVT] getMediaSessionInfo error: %@", error.localizedDescription);
+                if (success) success(0);
+            };
+            [infoCmd send];
+        }
+    };
+    sessionsCmd.callbackError = ^(NSError *error) {
+        NSLog(@"[WebOS_AVT] getActiveMediaSessions error: %@", error.localizedDescription);
+        if (success) success(0);
+    };
+    [sessionsCmd send];
 }
 
 - (ServiceSubscription *)subscribePlayStateWithSuccess:(MediaPlayStateSuccessBlock)success failure:(FailureBlock)failure
