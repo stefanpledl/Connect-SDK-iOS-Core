@@ -24,6 +24,7 @@
 #import "DeviceService.h"
 #import "AirPlayServiceHTTP.h"
 #import "AirPlayServiceMirrored.h"
+#import "AirPlayServiceConfig.h"
 #import "MediaPlayer.h"
 #import "MediaControl.h"
 #import "WebAppLauncher.h"

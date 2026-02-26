@@ -102,6 +102,13 @@ static AirPlayServiceMode airPlayServiceMode;
     return YES;
 }
 
+- (DeviceServicePairingType) pairingType
+{
+    if ([AirPlayService serviceMode] == AirPlayServiceModeMedia)
+        return DeviceServicePairingTypePinCode;
+    return DeviceServicePairingTypeNone;
+}
+
 - (void) connect
 {
     if ([AirPlayService serviceMode] == AirPlayServiceModeWebApp)

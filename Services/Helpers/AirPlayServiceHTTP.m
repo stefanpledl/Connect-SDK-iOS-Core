@@ -116,6 +116,16 @@
 
 - (int) sendCommand:(ServiceCommand *)command withPayload:(id)payload toURL:(NSURL *)URL
 {
+    // Route through authenticated socket if delegate says so
+    if (self.authCommandDelegate &&
+        [self.authCommandDelegate airPlayServiceHTTPShouldUseAuthForCommand:command]) {
+        [self.authCommandDelegate airPlayServiceHTTP:self
+                                         sendCommand:command
+                                         withPayload:payload
+                                               toURL:URL];
+        return -1;
+    }
+
     CTASIHTTPRequest *request = [CTASIHTTPRequest requestWithURL:command.target];
 
     if (payload || [command.HTTPMethod isEqualToString:@"POST"] || [command.HTTPMethod isEqualToString:@"PUT"])

@@ -23,6 +23,23 @@
 #import "MediaControl.h"
 
 @class AirPlayService;
+@class AirPlayServiceHTTP;
+@class ServiceCommand;
+
+/// Protocol for routing AirPlay commands through an authenticated socket.
+/// Implemented by CastingBridge (Swift) and set when AirPlay auth is active.
+@protocol AirPlayAuthCommandDelegate <NSObject>
+
+/// Return YES if this command should be routed through the authenticated socket.
+- (BOOL)airPlayServiceHTTPShouldUseAuthForCommand:(ServiceCommand *)command;
+
+/// Send the command through the authenticated socket instead of CTASIHTTPRequest.
+- (void)airPlayServiceHTTP:(AirPlayServiceHTTP *)http
+                sendCommand:(ServiceCommand *)command
+                withPayload:(id)payload
+                      toURL:(NSURL *)URL;
+
+@end
 
 @interface AirPlayServiceHTTP : NSObject <MediaPlayer, MediaControl>
 
@@ -33,5 +50,6 @@
 @property (nonatomic, readonly) AirPlayService *service;
 @property (nonatomic, readonly) BOOL connecting;
 @property (nonatomic, readonly) BOOL connected;
+@property (nonatomic, weak) id<AirPlayAuthCommandDelegate> authCommandDelegate;
 
 @end
