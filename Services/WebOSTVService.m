@@ -3188,4 +3188,37 @@ typedef NSTimeInterval (^SSAPMediaExtractor)(NSDictionary *response);
     }
 }
 
+- (void) checkConnectionAliveWithTimeout:(NSTimeInterval)timeout
+                                 success:(void (^)(void))success
+                                 failure:(void (^)(NSError *error))failure
+{
+    if (!self.connected) {
+        if (failure) failure([ConnectError generateErrorWithCode:ConnectStatusCodeError andDetails:@"socket not connected"]);
+        return;
+    }
+
+    __block BOOL completed = NO;
+    NSURL *URL = [NSURL URLWithString:@"ssap://com.webos.service.update/getCurrentSWInformation"];
+    ServiceCommand *command = [ServiceAsyncCommand commandWithDelegate:self.socket target:URL payload:nil];
+    command.callbackComplete = ^(NSDictionary *response) {
+        if (completed) return;
+        completed = YES;
+        if (success) success();
+    };
+    command.callbackError = ^(NSError *error) {
+        if (completed) return;
+        completed = YES;
+        if (failure) failure(error);
+    };
+    [command send];
+
+    // A dead-but-unclosed TCP socket swallows the write with no callback, so
+    // bound the wait ourselves.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (completed) return;
+        completed = YES;
+        if (failure) failure([ConnectError generateErrorWithCode:ConnectStatusCodeTvError andDetails:@"liveness probe timed out"]);
+    });
+}
+
 @end

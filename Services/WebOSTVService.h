@@ -114,4 +114,12 @@ typedef void (^ SystemInfoSuccessBlock)(NSArray *featureList);
 - (void)getSystemInfoWithSuccess:(SystemInfoSuccessBlock)success failure:(FailureBlock)failure;
 // @endcond
 
+
+// Liveness probe added for LocalCast: round-trips a harmless SSAP query to
+// detect a socket that died while the app was backgrounded, with a manual
+// timeout (a dead-but-unclosed socket never calls back on its own).
+- (void) checkConnectionAliveWithTimeout:(NSTimeInterval)timeout
+                                 success:(void (^)(void))success
+                                 failure:(void (^)(NSError *error))failure;
+
 @end
