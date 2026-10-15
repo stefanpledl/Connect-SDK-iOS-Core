@@ -1314,6 +1314,16 @@ typedef NSTimeInterval (^SSAPMediaExtractor)(NSDictionary *response);
 
 - (void) displayImageWithMediaInfo:(MediaInfo *)mediaInfo success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
 {
+    // The TV's native photo app (SSAP) shows stills reliably on every webOS
+    // version. DLNA/AVTransport is tried first for parity with video, but some
+    // webOS renderers reject an image transition with UPnP 701 "Transition not
+    // available" (device test 2026-10-15, LG OLED55G57LW). On that failure,
+    // fall back to the native player instead of surfacing the error.
+    __weak typeof(self) weakSelf = self;
+    void (^launchNative)(void) = ^{
+        [weakSelf launchNativeMediaPlayerWithMediaInfo:mediaInfo mediaType:@"PHOTO" success:success failure:failure];
+    };
+
     if (self.dlnaService)
     {
         id<MediaPlayer> mediaPlayer;
@@ -1323,12 +1333,15 @@ typedef NSTimeInterval (^SSAPMediaExtractor)(NSDictionary *response);
 
         if (mediaPlayer && [mediaPlayer respondsToSelector:@selector(displayImageWithMediaInfo:success:failure:)])
         {
-            [mediaPlayer displayImageWithMediaInfo:mediaInfo success:success failure:failure];
+            [mediaPlayer displayImageWithMediaInfo:mediaInfo success:success failure:^(NSError *error) {
+                NSLog(@"[WebOS_AVT] DLNA displayImage failed (%@) - falling back to native photo app", error.localizedDescription);
+                launchNative();
+            }];
             return;
         }
     }
 
-    [self launchNativeMediaPlayerWithMediaInfo:mediaInfo mediaType:@"PHOTO" success:success failure:failure];
+    launchNative();
 }
 
 - (void) playMedia:(NSURL *)mediaURL iconURL:(NSURL *)iconURL title:(NSString *)title description:(NSString *)description mimeType:(NSString *)mimeType shouldLoop:(BOOL)shouldLoop success:(MediaPlayerDisplaySuccessBlock)success failure:(FailureBlock)failure

@@ -286,6 +286,12 @@
 
 - (void) addService:(DeviceService *)service
 {
+    if (!service || !service.serviceName)
+    {
+        DLog(@"Ignoring service with nil serviceName");
+        return;
+    }
+
     DeviceService *existingService = [_services objectForKey:service.serviceName];
 
     NSArray *oldCapabilities = self.capabilities;
