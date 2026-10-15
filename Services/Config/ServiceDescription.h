@@ -40,6 +40,13 @@
 @property (nonatomic, strong) NSDictionary *locationResponseHeaders;
 @property (nonatomic) double lastDetection;
 /**
+ * @brief Raw Bonjour TXT `features` value of an `_airplay._tcp` service
+ * (e.g. "0x7F8AD0,0xB8BCF46"). Nil for every other service type. The AirPlay
+ * feature bits tell a sender what the receiver implements before any
+ * connection is made; bit 0 (SupportsAirPlayVideoV1) is the URL /play endpoint.
+ */
+@property (nonatomic, strong) NSString *airPlayFeatures;
+/**
  * @brief A device object set by a discovery provider when a service requires it (that is, it is the
  * only way to control the remote device).
  *

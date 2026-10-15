@@ -273,6 +273,16 @@
     NSString *commandPath = [NSString stringWithFormat:@"http://%@:%@/", address, @(port)];
     serviceDescription.commandURL = [NSURL URLWithString:commandPath];
 
+    // AirPlay receivers advertise their capability bits in the TXT record.
+    // Keep the raw string; the app decides what the bits mean.
+    if (TXTRecordData && [sender.type rangeOfString:@"_airplay."].location != NSNotFound)
+    {
+        NSDictionary<NSString *, NSData *> *txtDict = [NSNetService dictionaryFromTXTRecordData:TXTRecordData];
+        NSData *featuresData = txtDict[@"features"];
+        if ([featuresData isKindOfClass:[NSData class]])
+            serviceDescription.airPlayFeatures = [[NSString alloc] initWithData:featuresData encoding:NSUTF8StringEncoding];
+    }
+
     [_discoveredDevices setObject:serviceDescription forKey:sender.name];
 
     if (self.delegate && [self.delegate respondsToSelector:@selector(discoveryProvider:didFindService:)])
