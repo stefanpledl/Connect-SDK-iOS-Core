@@ -1526,48 +1526,81 @@ typedef NSTimeInterval (^SSAPMediaExtractor)(NSDictionary *response);
 
 - (void)playWithSuccess:(SuccessBlock)success failure:(FailureBlock)failure
 {
-    NSURL *URL = [NSURL URLWithString:@"ssap://media.controls/play"];
-
-    ServiceCommand *command = [ServiceAsyncCommand commandWithDelegate:self.socket target:URL payload:nil];
-    command.callbackComplete = ^(id response) {
-        // Resume from paused position
+    // Resume the paused-position estimator, shared by both transports.
+    void (^markResumed)(void) = ^{
         if (self->_playbackPaused && self->_playbackPausedPosition > 0) {
             self->_playbackStartTime = [NSDate dateWithTimeIntervalSinceNow:-self->_playbackPausedPosition];
-            self->_playbackPaused = NO;
         }
-        if (success) success(response);
+        self->_playbackPaused = NO;
     };
+
+    // Media plays on the TV's DLNA/AVTransport renderer (playMediaWithMediaInfo
+    // routes through dlnaService), so control it there too — SSAP media.controls
+    // targets a different player and does not affect DLNA playback (device test
+    // 2026-10-15: pause had no effect). Fall back to SSAP only when no
+    // AVTransport URL is known.
+    if (_avTransportControlURL) {
+        [self sendAVTransportSOAP:@"Play"
+                       soapAction:@"\"urn:schemas-upnp-org:service:AVTransport:1#Play\""
+                         extraXML:@"<Speed>1</Speed>"
+                          success:^(NSString *xml) { markResumed(); if (success) success(nil); }
+                          failure:failure];
+        return;
+    }
+
+    NSURL *URL = [NSURL URLWithString:@"ssap://media.controls/play"];
+    ServiceCommand *command = [ServiceAsyncCommand commandWithDelegate:self.socket target:URL payload:nil];
+    command.callbackComplete = ^(id response) { markResumed(); if (success) success(response); };
     command.callbackError = failure;
     [command send];
 }
 
 - (void)pauseWithSuccess:(SuccessBlock)success failure:(FailureBlock)failure
 {
-    NSURL *URL = [NSURL URLWithString:@"ssap://media.controls/pause"];
-
-    ServiceCommand *command = [ServiceAsyncCommand commandWithDelegate:self.socket target:URL payload:nil];
-    command.callbackComplete = ^(id response) {
-        // Save current position estimate
+    void (^markPaused)(void) = ^{
         if (self->_playbackStartTime && !self->_playbackPaused) {
             self->_playbackPausedPosition = -[self->_playbackStartTime timeIntervalSinceNow];
             self->_playbackPaused = YES;
         }
-        if (success) success(response);
     };
+
+    // See playWithSuccess: control the DLNA renderer that is actually playing.
+    if (_avTransportControlURL) {
+        [self sendAVTransportSOAP:@"Pause"
+                       soapAction:@"\"urn:schemas-upnp-org:service:AVTransport:1#Pause\""
+                         extraXML:nil
+                          success:^(NSString *xml) { markPaused(); if (success) success(nil); }
+                          failure:failure];
+        return;
+    }
+
+    NSURL *URL = [NSURL URLWithString:@"ssap://media.controls/pause"];
+    ServiceCommand *command = [ServiceAsyncCommand commandWithDelegate:self.socket target:URL payload:nil];
+    command.callbackComplete = ^(id response) { markPaused(); if (success) success(response); };
     command.callbackError = failure;
     [command send];
 }
 
 - (void)stopWithSuccess:(SuccessBlock)success failure:(FailureBlock)failure
 {
-    NSURL *URL = [NSURL URLWithString:@"ssap://media.controls/stop"];
-
-    ServiceCommand *command = [ServiceAsyncCommand commandWithDelegate:self.socket target:URL payload:nil];
-    command.callbackComplete = ^(id response) {
+    void (^markStopped)(void) = ^{
         self->_playbackStartTime = nil;
         self->_playbackPaused = NO;
-        if (success) success(response);
     };
+
+    // See playWithSuccess: control the DLNA renderer that is actually playing.
+    if (_avTransportControlURL) {
+        [self sendAVTransportSOAP:@"Stop"
+                       soapAction:@"\"urn:schemas-upnp-org:service:AVTransport:1#Stop\""
+                         extraXML:nil
+                          success:^(NSString *xml) { markStopped(); if (success) success(nil); }
+                          failure:failure];
+        return;
+    }
+
+    NSURL *URL = [NSURL URLWithString:@"ssap://media.controls/stop"];
+    ServiceCommand *command = [ServiceAsyncCommand commandWithDelegate:self.socket target:URL payload:nil];
+    command.callbackComplete = ^(id response) { markStopped(); if (success) success(response); };
     command.callbackError = failure;
     [command send];
 }
