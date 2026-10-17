@@ -956,12 +956,28 @@ static const NSInteger kValueNotFound = -1;
 
 - (void) playMedia:(MediaInfo *)mediaInfo shouldLoop:(BOOL)shouldLoop success:(MediaPlayerDisplaySuccessBlock)success failure:(FailureBlock)failure
 {
-    NSURL *iconURL;
-    if(mediaInfo.images){
-        ImageInfo *imageInfo = [mediaInfo.images firstObject];
-        iconURL = imageInfo.url;
-    }
-    [self playMedia:mediaInfo.url iconURL:iconURL title:mediaInfo.title description:mediaInfo.description mimeType:mediaInfo.mimeType shouldLoop:shouldLoop success:success failure:failure];
+    // LOCALCAST PATCH: forward the MediaInfo as it is.
+    //
+    // This used to pull url/icon/title/description/mimeType out of the
+    // MediaInfo and hand those five values to the URL-based overload, which
+    // builds a *fresh* MediaInfo from them. Everything not among those five
+    // was silently dropped on the way — subtitleInfo above all. The result:
+    // the caller sets a subtitle, playMediaWithMediaInfo: receives a
+    // MediaInfo whose subtitleInfo is nil, and the DIDL-Lite metadata goes
+    // to the renderer without a single sec:CaptionInfo / pv:subtitleFileUri
+    // element. The TV never learns the subtitle exists and never fetches it.
+    //
+    // Nothing is lost by forwarding directly: playMediaMetadataXMLForMediaInfo:
+    // reads mediaInfo.images for the album art itself. Android's DLNAService
+    // already passes the subtitle through (DLNAService.java:374); this brings
+    // the iOS port in line.
+    [self playMediaWithMediaInfo:mediaInfo
+                      shouldLoop:shouldLoop
+                         success:^(MediaLaunchObject *mediaLaunchObject) {
+        if (success) {
+            success(mediaLaunchObject.session, mediaLaunchObject.mediaControl);
+        }
+    } failure:failure];
 }
 
 - (void) playMediaWithMediaInfo:(MediaInfo *)mediaInfo shouldLoop:(BOOL)shouldLoop success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
