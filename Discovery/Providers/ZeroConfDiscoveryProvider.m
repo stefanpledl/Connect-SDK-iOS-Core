@@ -281,6 +281,14 @@
         NSData *featuresData = txtDict[@"features"];
         if ([featuresData isKindOfClass:[NSData class]])
             serviceDescription.airPlayFeatures = [[NSString alloc] initWithData:featuresData encoding:NSUTF8StringEncoding];
+        // `model` ("AppleTV14,1", …) and `manufacturer` ("Roku", …) say what
+        // the receiver is; the app hides the AirPlay entry of a Roku host.
+        NSData *modelData = txtDict[@"model"];
+        if ([modelData isKindOfClass:[NSData class]])
+            serviceDescription.modelName = [[NSString alloc] initWithData:modelData encoding:NSUTF8StringEncoding];
+        NSData *manufacturerData = txtDict[@"manufacturer"];
+        if ([manufacturerData isKindOfClass:[NSData class]])
+            serviceDescription.manufacturer = [[NSString alloc] initWithData:manufacturerData encoding:NSUTF8StringEncoding];
     }
 
     [_discoveredDevices setObject:serviceDescription forKey:sender.name];
