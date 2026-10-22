@@ -24,6 +24,7 @@
 #import "ConnectUtil.h"
 #import "DeviceServiceReachability.h"
 #import "DiscoveryManager.h"
+#import "SubtitleInfo.h"
 
 #import "NSObject+FeatureNotSupported_Private.h"
 
@@ -31,6 +32,8 @@
 {
     DIALService *_dialService;
     DeviceServiceReachability *_serviceReachability;
+    /// The channel the last launch went to; decides how controls are sent.
+    NSString *_activeChannel;
 }
 @end
 
@@ -685,6 +688,7 @@ static NSString *localCastChannelIn(NSArray *appList)
     command.HTTPMethod = @"POST";
     command.callbackComplete = ^(id responseObject)
     {
+        self->_activeChannel = channel;
         LaunchSession *launchSession = [LaunchSession launchSessionForAppId:channel];
         launchSession.name = @"Roku Media Player";
         launchSession.sessionType = LaunchSessionTypeMedia;
@@ -781,6 +785,14 @@ static NSString *localCastChannelIn(NSArray *appList)
                            iconURL ? [ConnectUtil urlEncode:iconURL.absoluteString] : @"(null)"
                            ];
     }
+    // Only the LocalCast receiver reads these (s=, loop=).
+    if ([channel isEqualToString:kRokuDevChannel] || [channel isEqualToString:kLocalCastRokuChannel]) {
+        NSString *subtitleUrl = mediaInfo.subtitleInfo.url.absoluteString;
+        if (subtitleUrl.length > 0) {
+            applicationPath = [applicationPath stringByAppendingFormat:@"&s=%@", [ConnectUtil urlEncode:subtitleUrl]];
+        }
+        if (shouldLoop) applicationPath = [applicationPath stringByAppendingString:@"&loop=1"];
+    }
 
     NSString *commandPath = [NSString pathWithComponents:@[
                                                            self.serviceDescription.commandURL.absoluteString,
@@ -794,6 +806,7 @@ static NSString *localCastChannelIn(NSArray *appList)
     command.HTTPMethod = @"POST";
     command.callbackComplete = ^(id responseObject)
     {
+        self->_activeChannel = channel;
         LaunchSession *launchSession = [LaunchSession launchSessionForAppId:channel];
         launchSession.name = @"Roku Media Player";
         launchSession.sessionType = LaunchSessionTypeMedia;
@@ -824,19 +837,50 @@ static NSString *localCastChannelIn(NSArray *appList)
     return CapabilityPriorityLevelHigh;
 }
 
+/// True while playback runs in LocalCast's own receiver (dev sideload or 569533 v2+).
+- (BOOL)ownReceiverActive
+{
+    return [_activeChannel isEqualToString:kRokuDevChannel] || [_activeChannel isEqualToString:kLocalCastRokuChannel];
+}
+
+/// LocalCast receiver command over ECP `input` (the channel reads them through
+/// roInput): cmd=play|pause|stop|seek&pos=<s>|subtitle. ECP's own keypresses
+/// only toggle play/pause and cannot seek.
+- (void)sendReceiverCommand:(NSString *)query success:(SuccessBlock)success failure:(FailureBlock)failure
+{
+    NSString *target = [NSString stringWithFormat:@"%@/input?%@", self.serviceDescription.commandURL.absoluteString, query];
+    ServiceCommand *command = [ServiceCommand commandWithDelegate:self.serviceCommandDelegate target:[NSURL URLWithString:target] payload:nil];
+    command.HTTPMethod = @"POST";
+    command.callbackComplete = ^(id responseObject) { if (success) success(responseObject); };
+    command.callbackError = failure;
+    [command send];
+}
+
 - (void)playWithSuccess:(SuccessBlock)success failure:(FailureBlock)failure
 {
+    if ([self ownReceiverActive]) {
+        [self sendReceiverCommand:@"cmd=play" success:success failure:failure];
+        return;
+    }
     [self sendKeyCode:RokuKeyCodePlay success:success failure:failure];
 }
 
 - (void)pauseWithSuccess:(SuccessBlock)success failure:(FailureBlock)failure
 {
+    if ([self ownReceiverActive]) {
+        [self sendReceiverCommand:@"cmd=pause" success:success failure:failure];
+        return;
+    }
     // Roku does not have pause, it only has play/pause
     [self sendKeyCode:RokuKeyCodePlay success:success failure:failure];
 }
 
 - (void)stopWithSuccess:(SuccessBlock)success failure:(FailureBlock)failure
 {
+    if ([self ownReceiverActive]) {
+        [self sendReceiverCommand:@"cmd=stop" success:success failure:failure];
+        return;
+    }
     // The Roku Media Player leaves playback on Back (its own menu stays up);
     // Home would also work but drops the user out of the channel.
     [self sendKeyCode:RokuKeyCodeBack success:success failure:failure];
@@ -854,6 +898,11 @@ static NSString *localCastChannelIn(NSArray *appList)
 
 - (void)seek:(NSTimeInterval)position success:(SuccessBlock)success failure:(FailureBlock)failure
 {
+    if ([self ownReceiverActive]) {
+        [self sendReceiverCommand:[NSString stringWithFormat:@"cmd=seek&pos=%.3f", position] success:success failure:failure];
+        return;
+    }
+    // The Roku Media Player has no ECP seek.
     [self sendNotSupportedFailure:failure];
 }
 
