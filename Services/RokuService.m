@@ -557,7 +557,73 @@ static NSString *rokuMediaPlayerState(NSString *xml)
     [self displayImage:mediaInfo.url iconURL:iconURL title:mediaInfo.title description:mediaInfo.description mimeType:mediaInfo.mimeType success:success failure:failure];
 }
 
+/// The Roku Media Player is a free store channel, not firmware: a Roku Express
+/// fresh from the box does not have it (device test 2026-10-22, `query/apps`
+/// listed four channels, 2213 absent → `launch/2213` 404). ECP `install/2213`
+/// opens its store page on the TV with an "Add channel" prompt; once the user
+/// confirms, the launch goes through. So: check `query/apps`, prompt if
+/// missing, poll until it appears (or give up with a message), then run `launch`.
+- (void)ensureMediaPlayerInstalledThen:(dispatch_block_t)launch failure:(FailureBlock)failure
+{
+    [self getAppListWithSuccess:^(NSArray *appList) {
+        for (AppInfo *app in appList) {
+            if ([app.id isEqualToString:kRokuMediaPlayerChannel]) {
+                launch();
+                return;
+            }
+        }
+        DLog(@"Roku: Media Player (2213) not installed — asking the TV to add it");
+        NSURL *installURL = [self.serviceDescription.commandURL URLByAppendingPathComponent:@"install"];
+        installURL = [installURL URLByAppendingPathComponent:kRokuMediaPlayerChannel];
+        ServiceCommand *install = [ServiceCommand commandWithDelegate:self.serviceCommandDelegate target:installURL payload:nil];
+        install.HTTPMethod = @"POST";
+        install.callbackComplete = ^(id responseObject) {
+            [self waitForMediaPlayerUntil:[NSDate dateWithTimeIntervalSinceNow:60] then:launch failure:failure];
+        };
+        install.callbackError = ^(NSError *error) {
+            if (failure)
+                failure([ConnectError generateErrorWithCode:ConnectStatusCodeTvError
+                                                 andDetails:@"roku_media_player_not_installed: install prompt failed"]);
+        };
+        [install send];
+    } failure:^(NSError *error) {
+        // Can't tell — try the launch anyway, the old behaviour.
+        launch();
+    }];
+}
+
+- (void)waitForMediaPlayerUntil:(NSDate *)deadline then:(dispatch_block_t)launch failure:(FailureBlock)failure
+{
+    if ([deadline timeIntervalSinceNow] <= 0) {
+        if (failure)
+            failure([ConnectError generateErrorWithCode:ConnectStatusCodeTvError
+                                             andDetails:@"roku_media_player_not_installed: confirm 'Add channel' on the Roku and cast again"]);
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self getAppListWithSuccess:^(NSArray *appList) {
+            for (AppInfo *app in appList) {
+                if ([app.id isEqualToString:kRokuMediaPlayerChannel]) {
+                    DLog(@"Roku: Media Player installed — launching");
+                    launch();
+                    return;
+                }
+            }
+            [self waitForMediaPlayerUntil:deadline then:launch failure:failure];
+        } failure:^(NSError *error) {
+            [self waitForMediaPlayerUntil:deadline then:launch failure:failure];
+        }];
+    });
+}
+
 - (void) displayImageWithMediaInfo:(MediaInfo *)mediaInfo success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
+{
+    [self ensureMediaPlayerInstalledThen:^{
+        [self launchMediaPlayerImageWithMediaInfo:mediaInfo success:success failure:failure];
+    } failure:failure];
+}
+
+- (void) launchMediaPlayerImageWithMediaInfo:(MediaInfo *)mediaInfo success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
 {
     NSURL *imageURL = mediaInfo.url;
     if (!imageURL)
@@ -625,6 +691,13 @@ static NSString *rokuMediaPlayerState(NSString *xml)
 }
 
 - (void) playMediaWithMediaInfo:(MediaInfo *)mediaInfo shouldLoop:(BOOL)shouldLoop success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
+{
+    [self ensureMediaPlayerInstalledThen:^{
+        [self launchMediaPlayerWithMediaInfo:mediaInfo shouldLoop:shouldLoop success:success failure:failure];
+    } failure:failure];
+}
+
+- (void) launchMediaPlayerWithMediaInfo:(MediaInfo *)mediaInfo shouldLoop:(BOOL)shouldLoop success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
 {
     NSURL *iconURL;
     if(mediaInfo.images){
