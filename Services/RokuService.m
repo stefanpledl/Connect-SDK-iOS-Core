@@ -36,6 +36,60 @@
 
 static NSMutableArray *registeredApps = nil;
 
+/// The Roku Media Player, preinstalled on every Roku OS.
+static NSString *const kRokuMediaPlayerChannel = @"2213";
+
+/// The `videoFormat`/`songFormat` the Roku Media Player expects: a short
+/// container/codec name, not a MIME type. HLS is "hls", DASH is "dash"; for
+/// progressive files the MIME subtype or the URL extension.
+static NSString *rokuMediaFormat(NSString *mimeType, NSURL *url)
+{
+    NSString *m = [mimeType lowercaseString] ?: @"";
+    if ([m containsString:@"mpegurl"]) return @"hls";
+    if ([m containsString:@"dash+xml"]) return @"dash";
+    if ([m containsString:@"x-matroska"]) return @"mkv";
+    if ([m containsString:@"quicktime"]) return @"mov";
+    if ([m isEqualToString:@"video/mp4"] || [m isEqualToString:@"audio/mp4"]) return @"mp4";
+    if ([m isEqualToString:@"audio/mpeg"] || [m isEqualToString:@"audio/mp3"]) return @"mp3";
+    if ([m containsString:@"x-m4a"]) return @"m4a";
+    if ([m containsString:@"aac"]) return @"aac";
+    if ([m containsString:@"flac"]) return @"flac";
+    if ([m containsString:@"wav"]) return @"wav";
+    if ([m containsString:@"mp2t"]) return @"ts";
+    NSString *ext = [url.pathExtension lowercaseString];
+    if (ext.length > 0 && ext.length <= 4) {
+        if ([ext isEqualToString:@"m3u8"]) return @"hls";
+        if ([ext isEqualToString:@"mpd"]) return @"dash";
+        return ext;
+    }
+    NSRange slash = [m rangeOfString:@"/"];
+    if (slash.location != NSNotFound && slash.location + 1 < m.length) {
+        return [m substringFromIndex:slash.location + 1];
+    }
+    return @"mp4";
+}
+
+/// Milliseconds of `<position>12345 ms</position>` / `<duration>…`, or -1.
+static NSTimeInterval rokuMediaPlayerMillis(NSString *xml, NSString *tag)
+{
+    if (xml.length == 0) return -1;
+    NSString *pattern = [NSString stringWithFormat:@"<%@>\\s*(\\d+)\\s*ms\\s*</%@>", tag, tag];
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern options:0 error:nil];
+    NSTextCheckingResult *match = [re firstMatchInString:xml options:0 range:NSMakeRange(0, xml.length)];
+    if (!match || match.numberOfRanges < 2) return -1;
+    return [[xml substringWithRange:[match rangeAtIndex:1]] doubleValue];
+}
+
+/// The `state` attribute of `<player state="play" …>`, or nil.
+static NSString *rokuMediaPlayerState(NSString *xml)
+{
+    if (xml.length == 0) return nil;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"<player[^>]*\\sstate=\"([^\"]*)\"" options:0 error:nil];
+    NSTextCheckingResult *match = [re firstMatchInString:xml options:0 range:NSMakeRange(0, xml.length)];
+    if (!match || match.numberOfRanges < 2) return nil;
+    return [xml substringWithRange:[match rangeAtIndex:1]];
+}
+
 @implementation RokuService
 
 + (void) initialize
@@ -75,8 +129,13 @@ static NSMutableArray *registeredApps = nil;
 
         kMediaControlPlay,
         kMediaControlPause,
+        kMediaControlStop,
         kMediaControlRewind,
         kMediaControlFastForward,
+        // From ECP query/media-player (Roku OS 7+)
+        kMediaControlPosition,
+        kMediaControlDuration,
+        kMediaControlPlayState,
 
         kTextInputControlSendText,
         kTextInputControlSendEnter,
@@ -509,24 +568,27 @@ static NSMutableArray *registeredApps = nil;
         return;
     }
     
-    NSString *applicationPath = [NSString stringWithFormat:@"15985?t=p&u=%@&tr=crossfade",
+    // Deep-link the built-in Roku Media Player (channel 2213) via ECP
+    // `launch`; see playMediaWithMediaInfo for why not `input` into 15985.
+    NSString *applicationPath = [NSString stringWithFormat:@"%@?t=p&u=%@&tr=crossfade",
+                                 kRokuMediaPlayerChannel,
                                  [ConnectUtil urlEncode:imageURL.absoluteString] // content path
                                  ];
-    
+
     NSString *commandPath = [NSString pathWithComponents:@[
                                                            self.serviceDescription.commandURL.absoluteString,
-                                                           @"input",
+                                                           @"launch",
                                                            applicationPath
                                                            ]];
-    
+
     NSURL *targetURL = [NSURL URLWithString:commandPath];
-    
+
     ServiceCommand *command = [ServiceCommand commandWithDelegate:self.serviceCommandDelegate target:targetURL payload:nil];
     command.HTTPMethod = @"POST";
     command.callbackComplete = ^(id responseObject)
     {
-        LaunchSession *launchSession = [LaunchSession launchSessionForAppId:@"15985"];
-        launchSession.name = @"simplevideoplayer";
+        LaunchSession *launchSession = [LaunchSession launchSessionForAppId:kRokuMediaPlayerChannel];
+        launchSession.name = @"Roku Media Player";
         launchSession.sessionType = LaunchSessionTypeMedia;
         launchSession.service = self;
         
@@ -581,21 +643,32 @@ static NSMutableArray *registeredApps = nil;
         return;
     }
     
-    NSString *mediaType = [[mimeType componentsSeparatedByString:@"/"] lastObject];
-    BOOL isVideo = [[mimeType substringToIndex:1] isEqualToString:@"v"];
-    
+    // Deep-link the receiver's built-in Roku Media Player (channel 2213) via
+    // ECP `launch`. Connect SDK used to `input` into channel 15985 — its own
+    // long-gone receiver app — which every Roku answers 404 (field: 0
+    // successes, 2026-10). 2213 ships on every Roku OS and takes the same
+    // t/u/videoName/videoFormat/songname parameters; `launch` (not `input`)
+    // starts it when it is not running.
+    NSString *mediaType = rokuMediaFormat(mimeType, mediaURL);
+    NSString *lowerMime = [mimeType lowercaseString] ?: @"";
+    BOOL isVideo = [lowerMime hasPrefix:@"video"]
+        || [lowerMime containsString:@"mpegurl"]
+        || [lowerMime containsString:@"dash+xml"];
+
     NSString *applicationPath;
-    
+
     if (isVideo)
     {
-        applicationPath = [NSString stringWithFormat:@"15985?t=v&u=%@&k=(null)&videoName=%@&videoFormat=%@",
+        applicationPath = [NSString stringWithFormat:@"%@?t=v&u=%@&k=(null)&videoName=%@&videoFormat=%@",
+                           kRokuMediaPlayerChannel,
                            [ConnectUtil urlEncode:mediaURL.absoluteString], // content path
                            title ? [ConnectUtil urlEncode:title] : @"(null)", // video name
                            ensureString(mediaType) // video format
                            ];
     } else
     {
-        applicationPath = [NSString stringWithFormat:@"15985?t=a&u=%@&k=(null)&songname=%@&artistname=%@&songformat=%@&albumarturl=%@",
+        applicationPath = [NSString stringWithFormat:@"%@?t=a&u=%@&k=(null)&songname=%@&artistname=%@&songformat=%@&albumarturl=%@",
+                           kRokuMediaPlayerChannel,
                            [ConnectUtil urlEncode:mediaURL.absoluteString], // content path
                            title ? [ConnectUtil urlEncode:title] : @"(null)", // song name
                            description ? [ConnectUtil urlEncode:description] : @"(null)", // artist name
@@ -603,21 +676,21 @@ static NSMutableArray *registeredApps = nil;
                            iconURL ? [ConnectUtil urlEncode:iconURL.absoluteString] : @"(null)"
                            ];
     }
-    
+
     NSString *commandPath = [NSString pathWithComponents:@[
                                                            self.serviceDescription.commandURL.absoluteString,
-                                                           @"input",
+                                                           @"launch",
                                                            applicationPath
                                                            ]];
-    
+
     NSURL *targetURL = [NSURL URLWithString:commandPath];
-    
+
     ServiceCommand *command = [ServiceCommand commandWithDelegate:self.serviceCommandDelegate target:targetURL payload:nil];
     command.HTTPMethod = @"POST";
     command.callbackComplete = ^(id responseObject)
     {
-        LaunchSession *launchSession = [LaunchSession launchSessionForAppId:@"15985"];
-        launchSession.name = @"simplevideoplayer";
+        LaunchSession *launchSession = [LaunchSession launchSessionForAppId:kRokuMediaPlayerChannel];
+        launchSession.name = @"Roku Media Player";
         launchSession.sessionType = LaunchSessionTypeMedia;
         launchSession.service = self;
          MediaLaunchObject *launchObject = [[MediaLaunchObject alloc] initWithLaunchSession:launchSession andMediaControl:self.mediaControl];
@@ -659,7 +732,9 @@ static NSMutableArray *registeredApps = nil;
 
 - (void)stopWithSuccess:(SuccessBlock)success failure:(FailureBlock)failure
 {
-    [self sendNotSupportedFailure:failure];
+    // The Roku Media Player leaves playback on Back (its own menu stays up);
+    // Home would also work but drops the user out of the channel.
+    [self sendKeyCode:RokuKeyCodeBack success:success failure:failure];
 }
 
 - (void)rewindWithSuccess:(SuccessBlock)success failure:(FailureBlock)failure
@@ -679,7 +754,15 @@ static NSMutableArray *registeredApps = nil;
 
 - (void)getPlayStateWithSuccess:(MediaPlayStateSuccessBlock)success failure:(FailureBlock)failure
 {
-    [self sendNotSupportedFailure:failure];
+    [self queryMediaPlayerWithSuccess:^(NSString *xml) {
+        NSString *state = rokuMediaPlayerState(xml);
+        MediaControlPlayState playState = MediaControlPlayStateUnknown;
+        if ([state isEqualToString:@"play"]) playState = MediaControlPlayStatePlaying;
+        else if ([state isEqualToString:@"pause"]) playState = MediaControlPlayStatePaused;
+        else if ([state isEqualToString:@"buffer"] || [state isEqualToString:@"open"]) playState = MediaControlPlayStateBuffering;
+        else if ([state isEqualToString:@"stop"] || [state isEqualToString:@"close"] || [state isEqualToString:@"none"]) playState = MediaControlPlayStateFinished;
+        if (success) success(playState);
+    } failure:failure];
 }
 
 - (ServiceSubscription *)subscribePlayStateWithSuccess:(MediaPlayStateSuccessBlock)success failure:(FailureBlock)failure
@@ -689,12 +772,48 @@ static NSMutableArray *registeredApps = nil;
 
 - (void)getDurationWithSuccess:(MediaPositionSuccessBlock)success
                        failure:(FailureBlock)failure {
-    [self sendNotSupportedFailure:failure];
+    [self queryMediaPlayerWithSuccess:^(NSString *xml) {
+        NSTimeInterval ms = rokuMediaPlayerMillis(xml, @"duration");
+        if (ms < 0) {
+            if (failure) failure([ConnectError generateErrorWithCode:ConnectStatusCodeTvError andDetails:@"No duration in media-player response"]);
+            return;
+        }
+        if (success) success(ms / 1000.0);
+    } failure:failure];
 }
 
 - (void)getPositionWithSuccess:(MediaPositionSuccessBlock)success failure:(FailureBlock)failure
 {
-    [self sendNotSupportedFailure:failure];
+    [self queryMediaPlayerWithSuccess:^(NSString *xml) {
+        NSTimeInterval ms = rokuMediaPlayerMillis(xml, @"position");
+        if (ms < 0) {
+            if (failure) failure([ConnectError generateErrorWithCode:ConnectStatusCodeTvError andDetails:@"No position in media-player response"]);
+            return;
+        }
+        if (success) success(ms / 1000.0);
+    } failure:failure];
+}
+
+/// `GET /query/media-player`: the receiver's current playback — state
+/// attribute (play/pause/stop/buffer/none), position and duration as
+/// "12345 ms". Works for whatever channel is playing, so for the Roku
+/// Media Player we launched.
+- (void)queryMediaPlayerWithSuccess:(void (^)(NSString *xml))success failure:(FailureBlock)failure
+{
+    NSURL *targetURL = [self.serviceDescription.commandURL URLByAppendingPathComponent:@"query"];
+    targetURL = [targetURL URLByAppendingPathComponent:@"media-player"];
+
+    ServiceCommand *command = [ServiceCommand commandWithDelegate:self.serviceCommandDelegate target:targetURL payload:nil];
+    command.HTTPMethod = @"GET";
+    command.callbackComplete = ^(id responseObject)
+    {
+        NSString *xml = [responseObject isKindOfClass:[NSString class]] ? responseObject
+            : ([responseObject isKindOfClass:[NSData class]]
+               ? [[NSString alloc] initWithData:responseObject encoding:NSUTF8StringEncoding] : @"");
+        if (success) success(xml ?: @"");
+    };
+    command.callbackError = failure;
+    [command send];
 }
 
 - (void)getMediaMetaDataWithSuccess:(SuccessBlock)success
