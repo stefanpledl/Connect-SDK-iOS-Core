@@ -18,6 +18,7 @@
 //  limitations under the License.
 //
 
+#import <UIKit/UIKit.h>
 #import "RokuService_Private.h"
 #import "ConnectError.h"
 #import "CTXMLReader.h"
@@ -195,10 +196,36 @@ static NSString *rokuMediaPlayerState(NSString *xml)
 
     if (self.delegate && [self.delegate respondsToSelector:@selector(deviceServiceConnectionSuccess:)])
         dispatch_on_main(^{ [self.delegate deviceServiceConnectionSuccess:self]; });
+    [self announceConnection:YES];
+}
+
+/// ECP has no session, so the app tells our receiver that it is here: on
+/// connect, launch the LocalCast channel (if installed) with
+/// cmd=connected&name=<phone> — it drops its "get the app" QR and names the
+/// phone — and on disconnect send cmd=disconnected. Best effort.
+- (void)announceConnection:(BOOL)nowConnected
+{
+    if (!nowConnected) {
+        if ([self ownReceiverActive])
+            [self sendReceiverCommand:@"cmd=disconnected" success:nil failure:nil];
+        return;
+    }
+    [self getAppListWithSuccess:^(NSArray *appList) {
+        NSString *own = localCastChannelIn(appList);
+        if (!own) return;
+        NSString *name = [UIDevice currentDevice].name ?: @"iPhone";
+        self->_activeChannel = own;
+        NSString *path = [NSString stringWithFormat:@"%@/launch/%@?cmd=connected&name=%@",
+                          self.serviceDescription.commandURL.absoluteString, own, [ConnectUtil urlEncode:name]];
+        ServiceCommand *command = [ServiceCommand commandWithDelegate:self.serviceCommandDelegate target:[NSURL URLWithString:path] payload:nil];
+        command.HTTPMethod = @"POST";
+        [command send];
+    } failure:nil];
 }
 
 - (void) disconnect
 {
+    [self announceConnection:NO];
     self.connected = NO;
 
     [_serviceReachability stop];
