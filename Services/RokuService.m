@@ -36,7 +36,8 @@
 
 static NSMutableArray *registeredApps = nil;
 
-/// The Roku Media Player, preinstalled on every Roku OS.
+/// The Roku Media Player — a free store channel (not firmware; a Roku Express
+/// out of the box has none), used when no LocalCast receiver is installed.
 static NSString *const kRokuMediaPlayerChannel = @"2213";
 
 /// The `videoFormat`/`songFormat` the Roku Media Player expects: a short
@@ -563,12 +564,41 @@ static NSString *rokuMediaPlayerState(NSString *xml)
 /// opens its store page on the TV with an "Add channel" prompt; once the user
 /// confirms, the launch goes through. So: check `query/apps`, prompt if
 /// missing, poll until it appears (or give up with a message), then run `launch`.
-- (void)ensureMediaPlayerInstalledThen:(dispatch_block_t)launch failure:(FailureBlock)failure
+/// LocalCast's own Roku channel (store id) and its sideloaded developer copy.
+static NSString *const kLocalCastRokuChannel = @"569533";
+static NSString *const kRokuDevChannel = @"dev";
+
+/// Our own receiver, if a usable one is installed: the sideloaded `dev` copy
+/// first, then the store channel 569533 — but only from major version 2, the
+/// SceneGraph rewrite of 2026-10-22 that speaks the t/u/videoName/videoFormat
+/// deep link (localcast_roku repo). The 2019 1.0.x channel launches and then
+/// plays nothing. nil → use the Roku Media Player path.
+static NSString *localCastChannelIn(NSArray *appList)
+{
+    for (NSString *wanted in @[kRokuDevChannel, kLocalCastRokuChannel]) {
+        for (AppInfo *app in appList) {
+            if (![app.id isEqualToString:wanted]) continue;
+            // appInfoFromDictionary keeps the <app> attributes in rawData; "version" is one of them.
+            NSString *version = [app.rawData isKindOfClass:[NSDictionary class]] ? [app.rawData objectForKey:@"version"] : nil;
+            NSInteger major = [[version componentsSeparatedByString:@"."].firstObject integerValue];
+            if (major >= 2 && [[app.name lowercaseString] containsString:@"localcast"]) return wanted;
+        }
+    }
+    return nil;
+}
+
+- (void)ensureReceiverThen:(void (^)(NSString *channel))launch failure:(FailureBlock)failure
 {
     [self getAppListWithSuccess:^(NSArray *appList) {
+        NSString *own = localCastChannelIn(appList);
+        if (own) {
+            DLog(@"Roku: using the LocalCast receiver channel %@", own);
+            launch(own);
+            return;
+        }
         for (AppInfo *app in appList) {
             if ([app.id isEqualToString:kRokuMediaPlayerChannel]) {
-                launch();
+                launch(kRokuMediaPlayerChannel);
                 return;
             }
         }
@@ -578,7 +608,9 @@ static NSString *rokuMediaPlayerState(NSString *xml)
         ServiceCommand *install = [ServiceCommand commandWithDelegate:self.serviceCommandDelegate target:installURL payload:nil];
         install.HTTPMethod = @"POST";
         install.callbackComplete = ^(id responseObject) {
-            [self waitForMediaPlayerUntil:[NSDate dateWithTimeIntervalSinceNow:60] then:launch failure:failure];
+            [self waitForMediaPlayerUntil:[NSDate dateWithTimeIntervalSinceNow:60]
+                                     then:^{ launch(kRokuMediaPlayerChannel); }
+                                  failure:failure];
         };
         install.callbackError = ^(NSError *error) {
             if (failure)
@@ -588,7 +620,7 @@ static NSString *rokuMediaPlayerState(NSString *xml)
         [install send];
     } failure:^(NSError *error) {
         // Can't tell — try the launch anyway, the old behaviour.
-        launch();
+        launch(kRokuMediaPlayerChannel);
     }];
 }
 
@@ -618,12 +650,12 @@ static NSString *rokuMediaPlayerState(NSString *xml)
 
 - (void) displayImageWithMediaInfo:(MediaInfo *)mediaInfo success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
 {
-    [self ensureMediaPlayerInstalledThen:^{
-        [self launchMediaPlayerImageWithMediaInfo:mediaInfo success:success failure:failure];
+    [self ensureReceiverThen:^(NSString *channel) {
+        [self launchChannel:channel imageWithMediaInfo:mediaInfo success:success failure:failure];
     } failure:failure];
 }
 
-- (void) launchMediaPlayerImageWithMediaInfo:(MediaInfo *)mediaInfo success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
+- (void) launchChannel:(NSString *)channel imageWithMediaInfo:(MediaInfo *)mediaInfo success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
 {
     NSURL *imageURL = mediaInfo.url;
     if (!imageURL)
@@ -637,7 +669,7 @@ static NSString *rokuMediaPlayerState(NSString *xml)
     // Deep-link the built-in Roku Media Player (channel 2213) via ECP
     // `launch`; see playMediaWithMediaInfo for why not `input` into 15985.
     NSString *applicationPath = [NSString stringWithFormat:@"%@?t=p&u=%@&tr=crossfade",
-                                 kRokuMediaPlayerChannel,
+                                 channel,
                                  [ConnectUtil urlEncode:imageURL.absoluteString] // content path
                                  ];
 
@@ -653,7 +685,7 @@ static NSString *rokuMediaPlayerState(NSString *xml)
     command.HTTPMethod = @"POST";
     command.callbackComplete = ^(id responseObject)
     {
-        LaunchSession *launchSession = [LaunchSession launchSessionForAppId:kRokuMediaPlayerChannel];
+        LaunchSession *launchSession = [LaunchSession launchSessionForAppId:channel];
         launchSession.name = @"Roku Media Player";
         launchSession.sessionType = LaunchSessionTypeMedia;
         launchSession.service = self;
@@ -692,12 +724,12 @@ static NSString *rokuMediaPlayerState(NSString *xml)
 
 - (void) playMediaWithMediaInfo:(MediaInfo *)mediaInfo shouldLoop:(BOOL)shouldLoop success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
 {
-    [self ensureMediaPlayerInstalledThen:^{
-        [self launchMediaPlayerWithMediaInfo:mediaInfo shouldLoop:shouldLoop success:success failure:failure];
+    [self ensureReceiverThen:^(NSString *channel) {
+        [self launchChannel:channel withMediaInfo:mediaInfo shouldLoop:shouldLoop success:success failure:failure];
     } failure:failure];
 }
 
-- (void) launchMediaPlayerWithMediaInfo:(MediaInfo *)mediaInfo shouldLoop:(BOOL)shouldLoop success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
+- (void) launchChannel:(NSString *)channel withMediaInfo:(MediaInfo *)mediaInfo shouldLoop:(BOOL)shouldLoop success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
 {
     NSURL *iconURL;
     if(mediaInfo.images){
@@ -733,7 +765,7 @@ static NSString *rokuMediaPlayerState(NSString *xml)
     if (isVideo)
     {
         applicationPath = [NSString stringWithFormat:@"%@?t=v&u=%@&k=(null)&videoName=%@&videoFormat=%@",
-                           kRokuMediaPlayerChannel,
+                           channel,
                            [ConnectUtil urlEncode:mediaURL.absoluteString], // content path
                            title ? [ConnectUtil urlEncode:title] : @"(null)", // video name
                            ensureString(mediaType) // video format
@@ -741,7 +773,7 @@ static NSString *rokuMediaPlayerState(NSString *xml)
     } else
     {
         applicationPath = [NSString stringWithFormat:@"%@?t=a&u=%@&k=(null)&songname=%@&artistname=%@&songformat=%@&albumarturl=%@",
-                           kRokuMediaPlayerChannel,
+                           channel,
                            [ConnectUtil urlEncode:mediaURL.absoluteString], // content path
                            title ? [ConnectUtil urlEncode:title] : @"(null)", // song name
                            description ? [ConnectUtil urlEncode:description] : @"(null)", // artist name
@@ -762,7 +794,7 @@ static NSString *rokuMediaPlayerState(NSString *xml)
     command.HTTPMethod = @"POST";
     command.callbackComplete = ^(id responseObject)
     {
-        LaunchSession *launchSession = [LaunchSession launchSessionForAppId:kRokuMediaPlayerChannel];
+        LaunchSession *launchSession = [LaunchSession launchSessionForAppId:channel];
         launchSession.name = @"Roku Media Player";
         launchSession.sessionType = LaunchSessionTypeMedia;
         launchSession.service = self;
