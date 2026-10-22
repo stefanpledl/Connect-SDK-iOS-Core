@@ -35,6 +35,10 @@
     DeviceServiceReachability *_serviceReachability;
     /// The channel the last launch went to; decides how controls are sent.
     NSString *_activeChannel;
+    BOOL _installPrompted;
+    BOOL _receiverStatusKnown;
+    NSString *_lastReceiverChannel;
+    NSString *_lastReceiverVersion;
 }
 @end
 
@@ -206,13 +210,26 @@ static NSString *rokuMediaPlayerState(NSString *xml)
 - (void)announceConnection:(BOOL)nowConnected
 {
     if (!nowConnected) {
+        self->_installPrompted = NO;
+        self->_receiverStatusKnown = NO;
         if ([self ownReceiverActive])
             [self sendReceiverCommand:@"cmd=disconnected" success:nil failure:nil];
         return;
     }
     [self getAppListWithSuccess:^(NSArray *appList) {
         NSString *own = localCastChannelIn(appList);
-        if (!own) return;
+        AppInfo *installed = localCastChannelInstalledIn(appList);
+        [self reportReceiverStatus:installed.id version:rokuAppVersion(installed)];
+        if (!own) {
+            // No usable receiver: open its store page on the TV now, while
+            // the user is still picking something to cast (Stefan,
+            // 2026-10-23: "nothing happened on connect"). Once per connection.
+            if (self->_installPrompted) return;
+            self->_installPrompted = YES;
+            DLog(@"Roku: no LocalCast receiver — opening its store page on the TV");
+            [self sendInstallPromptFor:kLocalCastRokuChannel complete:nil error:nil];
+            return;
+        }
         NSString *name = [UIDevice currentDevice].name ?: @"iPhone";
         self->_activeChannel = own;
         NSString *path = [NSString stringWithFormat:@"%@/launch/%@?cmd=connected&name=%@",
@@ -609,6 +626,28 @@ static NSString *const kRokuDevChannel = @"dev";
 /// SceneGraph rewrite of 2026-10-22 that speaks the t/u/videoName/videoFormat
 /// deep link (localcast_roku repo). The 2019 1.0.x channel launches and then
 /// plays nothing. nil → use the Roku Media Player path.
+/// The <app> "version" attribute, kept in rawData by appInfoFromDictionary.
+static NSString *rokuAppVersion(AppInfo *app)
+{
+    if (![app.rawData isKindOfClass:[NSDictionary class]]) return nil;
+    id version = [app.rawData objectForKey:@"version"];
+    return [version isKindOfClass:[NSString class]] ? version : nil;
+}
+
+/// The LocalCast channel whatever its version — `dev` first, then the store
+/// id — or nil when none is installed. The app turns the version into
+/// install/update advice.
+static AppInfo *localCastChannelInstalledIn(NSArray *appList)
+{
+    for (NSString *wanted in @[kRokuDevChannel, kLocalCastRokuChannel]) {
+        for (AppInfo *app in appList) {
+            if (![app.id isEqualToString:wanted]) continue;
+            if ([[app.name lowercaseString] containsString:@"localcast"]) return app;
+        }
+    }
+    return nil;
+}
+
 static NSString *localCastChannelIn(NSArray *appList)
 {
     for (NSString *wanted in @[kRokuDevChannel, kLocalCastRokuChannel]) {
@@ -638,48 +677,75 @@ static NSString *localCastChannelIn(NSArray *appList)
                 return;
             }
         }
-        DLog(@"Roku: Media Player (2213) not installed — asking the TV to add it");
-        NSURL *installURL = [self.serviceDescription.commandURL URLByAppendingPathComponent:@"install"];
-        installURL = [installURL URLByAppendingPathComponent:kRokuMediaPlayerChannel];
-        ServiceCommand *install = [ServiceCommand commandWithDelegate:self.serviceCommandDelegate target:installURL payload:nil];
-        install.HTTPMethod = @"POST";
-        install.callbackComplete = ^(id responseObject) {
-            [self waitForMediaPlayerUntil:[NSDate dateWithTimeIntervalSinceNow:60]
-                                     then:^{ launch(kRokuMediaPlayerChannel); }
-                                  failure:failure];
-        };
-        install.callbackError = ^(NSError *error) {
+        DLog(@"Roku: no LocalCast receiver and no Media Player — opening the receiver's store page");
+        [self sendInstallPromptFor:kLocalCastRokuChannel complete:^{
+            [self waitForReceiverUntil:[NSDate dateWithTimeIntervalSinceNow:60] then:launch failure:failure];
+        } error:^{
             if (failure)
                 failure([ConnectError generateErrorWithCode:ConnectStatusCodeTvError
-                                                 andDetails:@"roku_media_player_not_installed: install prompt failed"]);
-        };
-        [install send];
+                                                 andDetails:@"roku_receiver_not_installed: install prompt failed"]);
+        }];
     } failure:^(NSError *error) {
         // Can't tell — try the launch anyway, the old behaviour.
         launch(kRokuMediaPlayerChannel);
     }];
 }
 
-- (void)waitForMediaPlayerUntil:(NSDate *)deadline then:(dispatch_block_t)launch failure:(FailureBlock)failure
+- (void)setReceiverStatusBlock:(void (^)(NSString *, NSString *))block
+{
+    _receiverStatusBlock = [block copy];
+    if (block && _receiverStatusKnown) block(_lastReceiverChannel, _lastReceiverVersion);
+}
+
+- (void)reportReceiverStatus:(NSString *)channel version:(NSString *)version
+{
+    _receiverStatusKnown = YES;
+    _lastReceiverChannel = channel;
+    _lastReceiverVersion = version;
+    if (_receiverStatusBlock) _receiverStatusBlock(channel, version);
+}
+
+/// ECP `install/<channel>`: opens the channel's store page on the TV.
+- (void)sendInstallPromptFor:(NSString *)channel complete:(dispatch_block_t)complete error:(dispatch_block_t)errorBlock
+{
+    NSURL *installURL = [self.serviceDescription.commandURL URLByAppendingPathComponent:@"install"];
+    installURL = [installURL URLByAppendingPathComponent:channel];
+    ServiceCommand *install = [ServiceCommand commandWithDelegate:self.serviceCommandDelegate target:installURL payload:nil];
+    install.HTTPMethod = @"POST";
+    install.callbackComplete = ^(id responseObject) { if (complete) complete(); };
+    install.callbackError = ^(NSError *error) { if (errorBlock) errorBlock(); };
+    [install send];
+}
+
+/// After the receiver's store page opened: poll `query/apps` until the
+/// LocalCast receiver (major ≥ 2) — or, should the user add that instead,
+/// the Roku Media Player — shows up, then launch it.
+- (void)waitForReceiverUntil:(NSDate *)deadline then:(void (^)(NSString *channel))launch failure:(FailureBlock)failure
 {
     if ([deadline timeIntervalSinceNow] <= 0) {
         if (failure)
             failure([ConnectError generateErrorWithCode:ConnectStatusCodeTvError
-                                             andDetails:@"roku_media_player_not_installed: confirm 'Add channel' on the Roku and cast again"]);
+                                             andDetails:@"roku_receiver_not_installed: add the LocalCast Receiver on the Roku and cast again"]);
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self getAppListWithSuccess:^(NSArray *appList) {
+            NSString *own = localCastChannelIn(appList);
+            if (own) {
+                DLog(@"Roku: LocalCast receiver installed — launching %@", own);
+                launch(own);
+                return;
+            }
             for (AppInfo *app in appList) {
                 if ([app.id isEqualToString:kRokuMediaPlayerChannel]) {
                     DLog(@"Roku: Media Player installed — launching");
-                    launch();
+                    launch(kRokuMediaPlayerChannel);
                     return;
                 }
             }
-            [self waitForMediaPlayerUntil:deadline then:launch failure:failure];
+            [self waitForReceiverUntil:deadline then:launch failure:failure];
         } failure:^(NSError *error) {
-            [self waitForMediaPlayerUntil:deadline then:launch failure:failure];
+            [self waitForReceiverUntil:deadline then:launch failure:failure];
         }];
     });
 }

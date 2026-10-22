@@ -60,4 +60,9 @@ typedef NSUInteger RokuKeyCode;
 
 + (void) registerApp:(NSString *)appId;
 
+/// What `query/apps` said about the LocalCast channel on connect: the channel
+/// id ("dev" or 569533) and its version, or nil/nil when none is installed.
+/// Delivered once per connection, immediately if already known when set.
+@property (nonatomic, copy) void (^receiverStatusBlock)(NSString *channel, NSString *version);
+
 @end
