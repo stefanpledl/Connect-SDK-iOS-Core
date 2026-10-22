@@ -49,6 +49,12 @@ static NSString *const kRokuMediaPlayerChannel = @"2213";
 static NSString *rokuMediaFormat(NSString *mimeType, NSURL *url)
 {
     NSString *m = [mimeType lowercaseString] ?: @"";
+    // A manifest URL wins over the MIME: the bridge defaults to video/mp4
+    // when the app names nothing, and the receiver then parsed an HLS
+    // master as MP4 (device test 2026-10-22).
+    NSString *pathExt = [url.pathExtension lowercaseString];
+    if ([pathExt isEqualToString:@"m3u8"]) return @"hls";
+    if ([pathExt isEqualToString:@"mpd"]) return @"dash";
     if ([m containsString:@"mpegurl"]) return @"hls";
     if ([m containsString:@"dash+xml"]) return @"dash";
     if ([m containsString:@"x-matroska"]) return @"mkv";
