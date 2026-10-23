@@ -255,6 +255,11 @@ static double searchAttemptsBeforeKill = 6.0;
     CFRelease(theSearchRequest);
 }
 
+- (void)socket:(SSDPSocketListener *)aSocket didEncounterError:(NSError *)anError
+{
+    NSLog(@"[SSDP] socket error on port %ld: %@", (long)aSocket.port, anError.localizedDescription);
+}
+
 #pragma mark - M-SEARCH Response Processing
 
 //* UDPSocket-delegate-method handle anew messages

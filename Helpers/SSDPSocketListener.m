@@ -24,7 +24,33 @@
 #import <sys/types.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
+#import <ifaddrs.h>
+#import <net/if.h>
+#import <errno.h>
+#import <string.h>
 #import "ConnectError.h"
+
+/// IPv4 address of the Wi-Fi interface (en0), or INADDR_ANY when there is
+/// none. Joining the SSDP group with INADDR_ANY lets the kernel pick the
+/// default-route interface, which on iOS is not always Wi-Fi (VPN utun,
+/// cellular with Wi-Fi Assist) — the join then fails or lands on the wrong
+/// interface and no SSDP device is ever found while Bonjour keeps working
+/// (iPhone log 2026-10-23 06:09: zero DLNA/webOS/Roku, AirPlay fine).
+static in_addr_t SSDPWifiInterfaceAddress(void)
+{
+    struct ifaddrs *list = NULL;
+    in_addr_t found = htonl(INADDR_ANY);
+    if (getifaddrs(&list) != 0) return found;
+    for (struct ifaddrs *ifa = list; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if ((ifa->ifa_flags & IFF_UP) == 0 || (ifa->ifa_flags & IFF_LOOPBACK)) continue;
+        if (strcmp(ifa->ifa_name, "en0") != 0) continue;
+        found = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr;
+        break;
+    }
+    freeifaddrs(list);
+    return found;
+}
 
 @implementation SSDPSocketListener
 {
@@ -111,31 +137,44 @@
 	{
 		struct ip_mreq mreq;
 		mreq.imr_multiaddr.s_addr = inet_addr(self.address.UTF8String);
-		mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-	  
+		mreq.imr_interface.s_addr = SSDPWifiInterfaceAddress();
+
 		if (setsockopt(theSocketDescriptor,IPPROTO_IP,IP_ADD_MEMBERSHIP,&mreq,sizeof(mreq)) < 0)
 		{
-			[self raiseError];
-			return;
+			// Not fatal: M-SEARCH replies are unicast and still arrive on a
+			// socket that is not a group member; only NOTIFY announcements
+			// are lost. Before 2026-10-23 this returned and the socket was
+			// never bound, silently killing SSDP discovery.
+			NSLog(@"[SSDP] IP_ADD_MEMBERSHIP %@ on port %ld failed: %s (errno %d) — continuing without multicast membership",
+			      self.address, (long)self.port, strerror(errno), errno);
+			if (mreq.imr_interface.s_addr != htonl(INADDR_ANY)) {
+				mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+				if (setsockopt(theSocketDescriptor,IPPROTO_IP,IP_ADD_MEMBERSHIP,&mreq,sizeof(mreq)) == 0)
+					NSLog(@"[SSDP] joined %@ via INADDR_ANY instead", self.address);
+			}
 		}
 	}
 
     if (setsockopt(theSocketDescriptor, SOL_SOCKET, SO_REUSEADDR, &theYesVariable, sizeof(theYesVariable)) < 0)
     {
+        NSLog(@"[SSDP] SO_REUSEADDR failed: %s (errno %d)", strerror(errno), errno);
         [self raiseError];
         return;
     }
     if (setsockopt(theSocketDescriptor, SOL_SOCKET, SO_REUSEPORT, &theYesVariable, sizeof(theYesVariable)) < 0)
     {
+        NSLog(@"[SSDP] SO_REUSEPORT failed: %s (errno %d)", strerror(errno), errno);
         [self raiseError];
         return;
     }
 
 	if (bind ( theSocketDescriptor, (void *)&theSocketAddress, sizeof(theSocketAddress)) < 0)
 	{
+		NSLog(@"[SSDP] bind port %ld failed: %s (errno %d)", (long)self.port, strerror(errno), errno);
 		[self raiseError];
 		return;
 	}
+	NSLog(@"[SSDP] socket open on port %ld (group %@)", (long)self.port, self.address);
     __strong __typeof__(self) strongSelf = self;
     if (strongSelf == nil) return;
     _dispatchSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, theSocketDescriptor, 0, strongSelf.workQueue);
