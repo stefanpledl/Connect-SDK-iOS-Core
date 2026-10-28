@@ -818,31 +818,65 @@ static NSError *rokuBlindLaunchFailure(NSError *appsError, NSError *ownError, NS
                                  [ConnectUtil urlEncode:imageURL.absoluteString] // content path
                                  ];
 
-    NSString *commandPath = [NSString pathWithComponents:@[
-                                                           self.serviceDescription.commandURL.absoluteString,
-                                                           @"launch",
-                                                           applicationPath
-                                                           ]];
-
-    NSURL *targetURL = [NSURL URLWithString:commandPath];
-
-    ServiceCommand *command = [ServiceCommand commandWithDelegate:self.serviceCommandDelegate target:targetURL payload:nil];
-    command.HTTPMethod = @"POST";
-    command.callbackComplete = ^(id responseObject)
-    {
+    [self sendMediaDeepLinkToChannel:channel applicationPath:applicationPath complete:^{
         self->_activeChannel = channel;
         LaunchSession *launchSession = [LaunchSession launchSessionForAppId:channel];
         launchSession.name = @"Roku Media Player";
         launchSession.sessionType = LaunchSessionTypeMedia;
         launchSession.service = self;
-        
+
         MediaLaunchObject *launchObject = [[MediaLaunchObject alloc] initWithLaunchSession:launchSession andMediaControl:self.mediaControl];
         if(success){
             success(launchObject);
         }
+    } failure:failure];
+}
+
+/// `<app id="dev" …>` of a `query/active-app` answer equals `channel`.
+static BOOL rokuActiveAppIs(NSString *xml, NSString *channel)
+{
+    if (![xml isKindOfClass:[NSString class]] || !channel) return NO;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"<app\\s[^>]*\\bid=\"([^\"]*)\"" options:0 error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:xml options:0 range:NSMakeRange(0, xml.length)];
+    if (!m) return NO;
+    return [[xml substringWithRange:[m rangeAtIndex:1]] isEqualToString:channel];
+}
+
+/// Deliver `applicationPath` (`<channel>?t=…&u=…`) to the receiver.
+///
+/// ECP `launch` on the channel that is already in the foreground RESTARTS it:
+/// splash screen and idle screen before every photo of a slideshow (device
+/// test 2026-10-28, "Exiting 'LocalCast Receiver' … EXIT_USER_NAV" on the
+/// debug console for each launch). Only `input` reaches the running
+/// instance — and it reaches whatever is in the foreground — so ask
+/// `query/active-app` first. A failed query (Limited network access answers
+/// 403) launches as before.
+- (void)sendMediaDeepLinkToChannel:(NSString *)channel applicationPath:(NSString *)applicationPath complete:(dispatch_block_t)complete failure:(FailureBlock)failure
+{
+    NSRange q = [applicationPath rangeOfString:@"?"];
+    NSString *query = q.location == NSNotFound ? @"" : [applicationPath substringFromIndex:q.location + 1];
+    NSString *base = self.serviceDescription.commandURL.absoluteString;
+    NSString *launchPath = [NSString pathWithComponents:@[base, @"launch", applicationPath]];
+    NSString *inputPath = [NSString pathWithComponents:@[base, [NSString stringWithFormat:@"input?%@", query]]];
+
+    void (^send)(NSString *) = ^(NSString *path) {
+        ServiceCommand *command = [ServiceCommand commandWithDelegate:self.serviceCommandDelegate target:[NSURL URLWithString:path] payload:nil];
+        command.HTTPMethod = @"POST";
+        command.callbackComplete = ^(id responseObject) { if (complete) complete(); };
+        command.callbackError = failure;
+        [command send];
     };
-    command.callbackError = failure;
-    [command send];
+
+    NSURL *activeURL = [[self.serviceDescription.commandURL URLByAppendingPathComponent:@"query"] URLByAppendingPathComponent:@"active-app"];
+    ServiceCommand *active = [ServiceCommand commandWithDelegate:self.serviceCommandDelegate target:activeURL payload:nil];
+    active.HTTPMethod = @"GET";
+    active.callbackComplete = ^(NSString *responseObject) {
+        BOOL running = rokuActiveAppIs(responseObject, channel);
+        DLog(@"Roku: %@ %@", channel, running ? @"is in the foreground — sending input" : @"is not active — launching");
+        send(running ? inputPath : launchPath);
+    };
+    active.callbackError = ^(NSError *error) { send(launchPath); };
+    [active send];
 }
 
 - (void) playMedia:(NSURL *)mediaURL iconURL:(NSURL *)iconURL title:(NSString *)title description:(NSString *)description mimeType:(NSString *)mimeType shouldLoop:(BOOL)shouldLoop success:(MediaPlayerDisplaySuccessBlock)success failure:(FailureBlock)failure
@@ -936,18 +970,7 @@ static NSError *rokuBlindLaunchFailure(NSError *appsError, NSError *ownError, NS
         if (shouldLoop) applicationPath = [applicationPath stringByAppendingString:@"&loop=1"];
     }
 
-    NSString *commandPath = [NSString pathWithComponents:@[
-                                                           self.serviceDescription.commandURL.absoluteString,
-                                                           @"launch",
-                                                           applicationPath
-                                                           ]];
-
-    NSURL *targetURL = [NSURL URLWithString:commandPath];
-
-    ServiceCommand *command = [ServiceCommand commandWithDelegate:self.serviceCommandDelegate target:targetURL payload:nil];
-    command.HTTPMethod = @"POST";
-    command.callbackComplete = ^(id responseObject)
-    {
+    [self sendMediaDeepLinkToChannel:channel applicationPath:applicationPath complete:^{
         self->_activeChannel = channel;
         LaunchSession *launchSession = [LaunchSession launchSessionForAppId:channel];
         launchSession.name = @"Roku Media Player";
@@ -957,9 +980,7 @@ static NSError *rokuBlindLaunchFailure(NSError *appsError, NSError *ownError, NS
          if(success){
             success(launchObject);
          }
-    };
-    command.callbackError = failure;
-    [command send];
+    } failure:failure];
 }
 
 - (void)closeMedia:(LaunchSession *)launchSession success:(SuccessBlock)success failure:(FailureBlock)failure
