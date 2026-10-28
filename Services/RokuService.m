@@ -337,7 +337,10 @@ static NSString *rokuMediaPlayerState(NSString *xml)
         {
             if ([httpResponse statusCode] < 200 || [httpResponse statusCode] >= 300)
             {
-                NSError *error = [ConnectError generateErrorWithCode:ConnectStatusCodeTvError andDetails:nil];
+                // Keep the status: a Roku in Limited mode answers 403 and
+                // the app tells the two cases apart by it.
+                NSError *error = [ConnectError generateErrorWithCode:ConnectStatusCodeTvError
+                                                          andDetails:[NSString stringWithFormat:@"HTTP %ld", (long)[httpResponse statusCode]]];
                 
                 if (command.callbackError)
                     command.callbackError(error);
@@ -662,32 +665,72 @@ static NSString *localCastChannelIn(NSArray *appList)
     return nil;
 }
 
-- (void)ensureReceiverThen:(void (^)(NSString *channel))launch failure:(FailureBlock)failure
+/// Error token the app reads: the Roku's "Control by mobile apps" setting refuses ECP.
+static NSString *const kRokuControlBlocked = @"roku_control_blocked";
+
+/// `sendCommand:` labels a refused request "API error: HTTP <status>".
+static BOOL rokuErrorIsForbidden(NSError *error)
+{
+    return [error.localizedDescription containsString:@"HTTP 403"];
+}
+
+/// The error for a cast that failed without an app list: prefixed with
+/// kRokuControlBlocked when the TV refused the query (403 — Limited or
+/// Disabled network access), else the three errors as they came.
+static NSError *rokuBlindLaunchFailure(NSError *appsError, NSError *ownError, NSError *mediaPlayerError)
+{
+    NSString *detail = [NSString stringWithFormat:@"query/apps: %@; launch/%@: %@; launch/%@: %@",
+                        appsError.localizedDescription ?: @"?",
+                        kLocalCastRokuChannel, ownError.localizedDescription ?: @"?",
+                        kRokuMediaPlayerChannel, mediaPlayerError.localizedDescription ?: @"?"];
+    if (rokuErrorIsForbidden(appsError))
+        detail = [NSString stringWithFormat:@"%@: %@", kRokuControlBlocked, detail];
+    return [ConnectError generateErrorWithCode:ConnectStatusCodeTvError andDetails:detail];
+}
+
+/// `launch` sends the ECP launch for a channel and reports its failure to the
+/// block it is handed, so the caller can chain a fallback.
+- (void)ensureReceiverThen:(void (^)(NSString *channel, FailureBlock launchFailure))launch failure:(FailureBlock)failure
 {
     [self getAppListWithSuccess:^(NSArray *appList) {
         NSString *own = localCastChannelIn(appList);
         if (own) {
             DLog(@"Roku: using the LocalCast receiver channel %@", own);
-            launch(own);
+            launch(own, failure);
             return;
         }
         for (AppInfo *app in appList) {
             if ([app.id isEqualToString:kRokuMediaPlayerChannel]) {
-                launch(kRokuMediaPlayerChannel);
+                launch(kRokuMediaPlayerChannel, failure);
                 return;
             }
         }
         DLog(@"Roku: no LocalCast receiver and no Media Player — opening the receiver's store page");
         [self sendInstallPromptFor:kLocalCastRokuChannel complete:^{
-            [self waitForReceiverUntil:[NSDate dateWithTimeIntervalSinceNow:60] then:launch failure:failure];
+            [self waitForReceiverUntil:[NSDate dateWithTimeIntervalSinceNow:60]
+                                  then:^(NSString *channel) { launch(channel, failure); }
+                               failure:failure];
         } error:^{
             if (failure)
                 failure([ConnectError generateErrorWithCode:ConnectStatusCodeTvError
                                                  andDetails:@"roku_receiver_not_installed: install prompt failed"]);
         }];
-    } failure:^(NSError *error) {
-        // Can't tell — try the launch anyway, the old behaviour.
-        launch(kRokuMediaPlayerChannel);
+    } failure:^(NSError *appsError) {
+        // `query/apps` refused, so nothing is known about the TV. Since Roku
+        // OS 14.1 "Control by mobile apps → Network access" defaults to
+        // Limited: every query answers 403, but app launches still go through
+        // (field: a TCL C147X, feedback ca0e4bd9, 2026-10-27 — the old
+        // fallback launched only the Media Player, which was not installed,
+        // and never tried our receiver). So launch blind — our own receiver
+        // first, then the Roku Media Player — and when both fail name the
+        // setting, so the app can tell the user where to switch it to Enabled.
+        DLog(@"Roku: query/apps failed (%@) — launching blind", appsError.localizedDescription);
+        launch(kLocalCastRokuChannel, ^(NSError *ownError) {
+            launch(kRokuMediaPlayerChannel, ^(NSError *mediaPlayerError) {
+                if (failure)
+                    failure(rokuBlindLaunchFailure(appsError, ownError, mediaPlayerError));
+            });
+        });
     }];
 }
 
@@ -752,8 +795,8 @@ static NSString *localCastChannelIn(NSArray *appList)
 
 - (void) displayImageWithMediaInfo:(MediaInfo *)mediaInfo success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
 {
-    [self ensureReceiverThen:^(NSString *channel) {
-        [self launchChannel:channel imageWithMediaInfo:mediaInfo success:success failure:failure];
+    [self ensureReceiverThen:^(NSString *channel, FailureBlock launchFailure) {
+        [self launchChannel:channel imageWithMediaInfo:mediaInfo success:success failure:launchFailure];
     } failure:failure];
 }
 
@@ -827,8 +870,8 @@ static NSString *localCastChannelIn(NSArray *appList)
 
 - (void) playMediaWithMediaInfo:(MediaInfo *)mediaInfo shouldLoop:(BOOL)shouldLoop success:(MediaPlayerSuccessBlock)success failure:(FailureBlock)failure
 {
-    [self ensureReceiverThen:^(NSString *channel) {
-        [self launchChannel:channel withMediaInfo:mediaInfo shouldLoop:shouldLoop success:success failure:failure];
+    [self ensureReceiverThen:^(NSString *channel, FailureBlock launchFailure) {
+        [self launchChannel:channel withMediaInfo:mediaInfo shouldLoop:shouldLoop success:success failure:launchFailure];
     } failure:failure];
 }
 
