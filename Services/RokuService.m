@@ -39,6 +39,7 @@
     BOOL _receiverStatusKnown;
     NSString *_lastReceiverChannel;
     NSString *_lastReceiverVersion;
+    BOOL _lastPromptOpened;
 }
 @end
 
@@ -219,17 +220,34 @@ static NSString *rokuMediaPlayerState(NSString *xml)
     [self getAppListWithSuccess:^(NSArray *appList) {
         NSString *own = localCastChannelIn(appList);
         AppInfo *installed = localCastChannelInstalledIn(appList);
-        [self reportReceiverStatus:installed.id version:rokuAppVersion(installed)];
+        NSString *installedId = installed.id;
+        NSString *installedVersion = rokuAppVersion(installed);
         if (!own) {
             // No usable receiver: open its store page on the TV now, while
             // the user is still picking something to cast (Stefan,
             // 2026-10-23: "nothing happened on connect"). Once per connection.
-            if (self->_installPrompted) return;
+            if (self->_installPrompted) {
+                // Already asked. While that request is still in flight its
+                // answer will report; afterwards repeat what it said.
+                if (self->_receiverStatusKnown)
+                    [self reportReceiverStatus:installedId version:installedVersion
+                                  promptOpened:self->_lastPromptOpened];
+                return;
+            }
             self->_installPrompted = YES;
             DLog(@"Roku: no LocalCast receiver — opening its store page on the TV");
-            [self sendInstallPromptFor:kLocalCastRokuChannel complete:nil error:nil];
+            // Reported only once the TV has answered: the app said "its page
+            // is open on the TV" while the TV had refused the request with
+            // 401 (field, 30 days to 2026-11-10: "install prompt failed").
+            [self sendInstallPromptFor:kLocalCastRokuChannel complete:^{
+                [self reportReceiverStatus:installedId version:installedVersion promptOpened:YES];
+            } error:^{
+                DLog(@"Roku: install prompt on connect refused");
+                [self reportReceiverStatus:installedId version:installedVersion promptOpened:NO];
+            }];
             return;
         }
+        [self reportReceiverStatus:installedId version:installedVersion promptOpened:YES];
         NSString *name = [UIDevice currentDevice].name ?: @"iPhone";
         self->_activeChannel = own;
         NSString *path = [NSString stringWithFormat:@"%@/launch/%@?cmd=connected&name=%@",
@@ -734,18 +752,20 @@ static NSError *rokuBlindLaunchFailure(NSError *appsError, NSError *ownError, NS
     }];
 }
 
-- (void)setReceiverStatusBlock:(void (^)(NSString *, NSString *))block
+- (void)setReceiverStatusBlock:(void (^)(NSString *, NSString *, BOOL))block
 {
     _receiverStatusBlock = [block copy];
-    if (block && _receiverStatusKnown) block(_lastReceiverChannel, _lastReceiverVersion);
+    if (block && _receiverStatusKnown)
+        block(_lastReceiverChannel, _lastReceiverVersion, _lastPromptOpened);
 }
 
-- (void)reportReceiverStatus:(NSString *)channel version:(NSString *)version
+- (void)reportReceiverStatus:(NSString *)channel version:(NSString *)version promptOpened:(BOOL)promptOpened
 {
     _receiverStatusKnown = YES;
     _lastReceiverChannel = channel;
     _lastReceiverVersion = version;
-    if (_receiverStatusBlock) _receiverStatusBlock(channel, version);
+    _lastPromptOpened = promptOpened;
+    if (_receiverStatusBlock) _receiverStatusBlock(channel, version, promptOpened);
 }
 
 /// ECP `install/<channel>`: opens the channel's store page on the TV.

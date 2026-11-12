@@ -63,6 +63,11 @@ typedef NSUInteger RokuKeyCode;
 /// What `query/apps` said about the LocalCast channel on connect: the channel
 /// id ("dev" or 569533) and its version, or nil/nil when none is installed.
 /// Delivered once per connection, immediately if already known when set.
-@property (nonatomic, copy) void (^receiverStatusBlock)(NSString *channel, NSString *version);
+///
+/// `promptOpened` is NO when no usable receiver is installed AND the TV
+/// refused `install/569533`, so no store page is on screen. The app's wording
+/// depends on it, so for a missing or outdated receiver the status is
+/// delivered only after the TV has answered the install request.
+@property (nonatomic, copy) void (^receiverStatusBlock)(NSString *channel, NSString *version, BOOL promptOpened);
 
 @end
